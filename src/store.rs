@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::options::run_dir_name;
@@ -144,7 +144,7 @@ pub fn fmt_pct(v: f64) -> String {
 }
 
 /// Kind of a process lifecycle event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProcessEvent {
     /// The process appeared in the tree.
@@ -649,6 +649,16 @@ mod tests {
     fn fmt_pct_rounds_to_two_decimals() {
         assert_eq!(fmt_pct(12.345), "12.35");
         assert_eq!(fmt_pct(0.0), "0.00");
+    }
+
+    #[test]
+    fn process_event_deserializes_from_string() {
+        let start: ProcessEvent =
+            serde_json::from_str("\"start\"").expect("start must deserialize");
+        assert_eq!(start, ProcessEvent::Start);
+
+        let exit: ProcessEvent = serde_json::from_str("\"exit\"").expect("exit must deserialize");
+        assert_eq!(exit, ProcessEvent::Exit);
     }
 
     #[test]

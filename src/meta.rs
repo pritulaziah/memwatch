@@ -1,12 +1,14 @@
 //! Run metadata written to `meta.json`.
 
 use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::{self, Write};
 use std::mem::size_of;
 use std::path::Path;
 
-use serde::{Serialize, Serializer};
+use serde::de;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use windows::Win32::Graphics::Dxgi::{
@@ -31,7 +33,7 @@ const WINDOWS_VERSION_KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion
 const CPU_KEY: &str = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0";
 
 /// Description of one run, written to `meta.json`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Meta {
     /// Version of the run directory format.
     pub schema_version: u32,
@@ -146,7 +148,7 @@ impl Meta {
 }
 
 /// Why the run stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndReason {
     /// The main process exited on its own.
@@ -157,6 +159,18 @@ pub enum EndReason {
     LaunchFailed,
     /// memwatch stopped because of its own error.
     MemwatchError,
+}
+
+impl Display for EndReason {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            EndReason::AppExited => "app_exited",
+            EndReason::CtrlC => "ctrl_c",
+            EndReason::LaunchFailed => "launch_failed",
+            EndReason::MemwatchError => "memwatch_error",
+        };
+        f.write_str(value)
+    }
 }
 
 /// State of one collector, written to `meta.json` as a string.
@@ -174,21 +188,51 @@ pub enum CollectorStatus {
     Failed(String),
 }
 
+impl Display for CollectorStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CollectorStatus::Ok => f.write_str("ok"),
+            CollectorStatus::Disabled => f.write_str("disabled"),
+            CollectorStatus::Unavailable => f.write_str("unavailable"),
+            CollectorStatus::Waiting => f.write_str("waiting"),
+            CollectorStatus::Failed(reason) => write!(f, "failed: {reason}"),
+        }
+    }
+}
+
 impl Serialize for CollectorStatus {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let value = match self {
-            CollectorStatus::Ok => "ok".to_string(),
-            CollectorStatus::Disabled => "disabled".to_string(),
-            CollectorStatus::Unavailable => "unavailable".to_string(),
-            CollectorStatus::Waiting => "waiting".to_string(),
-            CollectorStatus::Failed(reason) => format!("failed: {reason}"),
-        };
-        serializer.serialize_str(&value)
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for CollectorStatus {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "ok" => Ok(CollectorStatus::Ok),
+            "disabled" => Ok(CollectorStatus::Disabled),
+            "unavailable" => Ok(CollectorStatus::Unavailable),
+            "waiting" => Ok(CollectorStatus::Waiting),
+            _ => match value.strip_prefix("failed: ") {
+                Some(reason) => Ok(CollectorStatus::Failed(reason.to_string())),
+                None => Err(de::Error::unknown_variant(
+                    &value,
+                    &[
+                        "ok",
+                        "disabled",
+                        "unavailable",
+                        "waiting",
+                        "failed: <reason>",
+                    ],
+                )),
+            },
+        }
     }
 }
 
 /// An executable that appeared in the process tree.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageInfo {
     /// Full path of the executable.
     pub path: String,
@@ -197,7 +241,7 @@ pub struct ImageInfo {
 }
 
 /// The machine the run was made on.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Host {
     /// Operating system name, version and build.
     pub os: String,
@@ -421,6 +465,7 @@ mod tests {
             out_dir: PathBuf::from("runs"),
             labels,
             interval: Duration::from_secs(1),
+            duration: None,
             gpu_interval: Duration::from_secs(2),
             cdp_interval: Duration::from_secs(10),
             cdp_port: None,
@@ -603,6 +648,19 @@ mod tests {
     }
 
     #[test]
+    fn end_reason_displays_snake_case() {
+        let cases = [
+            (EndReason::AppExited, "app_exited"),
+            (EndReason::CtrlC, "ctrl_c"),
+            (EndReason::LaunchFailed, "launch_failed"),
+            (EndReason::MemwatchError, "memwatch_error"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(reason.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn collector_status_serializes_as_string() {
         let cases = [
             (CollectorStatus::Ok, "\"ok\""),
@@ -617,6 +675,57 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn collector_status_displays_string() {
+        let cases = [
+            (CollectorStatus::Ok, "ok"),
+            (CollectorStatus::Disabled, "disabled"),
+            (CollectorStatus::Unavailable, "unavailable"),
+            (CollectorStatus::Waiting, "waiting"),
+            (CollectorStatus::Failed("x".to_string()), "failed: x"),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(status.to_string(), expected);
+            assert_eq!(
+                serde_json::to_string(&status).expect("the status must serialize"),
+                format!("\"{expected}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn collector_status_deserializes_from_string() {
+        let cases = [
+            ("\"ok\"", CollectorStatus::Ok),
+            ("\"disabled\"", CollectorStatus::Disabled),
+            ("\"unavailable\"", CollectorStatus::Unavailable),
+            ("\"waiting\"", CollectorStatus::Waiting),
+            ("\"failed: x\"", CollectorStatus::Failed("x".to_string())),
+        ];
+        for (json, expected) in cases {
+            let status: CollectorStatus =
+                serde_json::from_str(json).expect("the status must deserialize");
+            assert_eq!(status, expected);
+        }
+
+        assert!(
+            serde_json::from_str::<CollectorStatus>("\"other\"").is_err(),
+            "an unknown status must be rejected"
+        );
+    }
+
+    #[test]
+    fn meta_deserializes_serialized_json() {
+        let meta = Meta::new(&sample_options(), sample_started(), sample_host());
+        let value = serde_json::to_value(&meta).expect("the metadata must serialize");
+
+        let parsed: Meta =
+            serde_json::from_value(value.clone()).expect("the metadata must deserialize");
+        let round_trip = serde_json::to_value(&parsed).expect("the metadata must serialize again");
+
+        assert_eq!(round_trip, value);
     }
 
     #[test]

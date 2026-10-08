@@ -180,6 +180,14 @@ pub fn run(opts: &RunOptions, stop: StopHandle) -> anyhow::Result<RunOutcome> {
         }
     };
 
+    if let Some(duration) = opts.duration {
+        let timer_stop = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            timer_stop.stop();
+        });
+    }
+
     let gpu_every_ticks = (opts.gpu_interval.as_millis() / opts.interval.as_millis()) as u32;
     let cdp = match opts.cdp_port {
         Some(port) => CdpCollector::start(port, opts.cdp_interval, started, cdp_table, log.clone()),

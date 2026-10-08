@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Display;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -21,6 +21,16 @@ impl RunLog {
     pub fn create(path: &Path) -> io::Result<RunLog> {
         Ok(RunLog {
             file: Arc::new(Mutex::new(File::create(path)?)),
+            warned: Arc::new(Mutex::new(HashSet::new())),
+        })
+    }
+
+    /// Opens the journal for appending, creating it when it is missing.
+    pub fn append(path: &Path) -> io::Result<RunLog> {
+        Ok(RunLog {
+            file: Arc::new(Mutex::new(
+                OpenOptions::new().append(true).create(true).open(path)?,
+            )),
             warned: Arc::new(Mutex::new(HashSet::new())),
         })
     }
@@ -109,5 +119,27 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content.lines().count(), 2);
+    }
+
+    #[test]
+    fn append_keeps_existing_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("memwatch.log");
+        let log = RunLog::create(&path).unwrap();
+        log.info("job", "started");
+        drop(log);
+
+        let log = RunLog::append(&path).unwrap();
+        log.info("report", "written");
+
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the appended line must not truncate the file"
+        );
+        assert!(lines[0].ends_with("INFO job: started"));
+        assert!(lines[1].ends_with("INFO report: written"));
     }
 }

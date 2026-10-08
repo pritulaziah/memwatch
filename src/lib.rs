@@ -1,10 +1,12 @@
 //! Records resource usage of a tree of Windows processes while it runs.
 
+pub mod analyze;
 pub mod collect;
 pub mod launch;
 pub mod log;
 pub mod meta;
 pub mod options;
+pub mod report;
 pub mod sampler;
 pub mod store;
 pub mod win;

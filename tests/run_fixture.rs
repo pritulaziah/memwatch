@@ -33,6 +33,7 @@ fn fixture_options(out_dir: &Path, command: Vec<OsString>) -> RunOptions {
         out_dir: out_dir.to_path_buf(),
         labels: BTreeMap::new(),
         interval: Duration::from_secs(1),
+        duration: None,
         gpu_interval: Duration::from_secs(2),
         cdp_interval: Duration::from_secs(10),
         cdp_port: None,
@@ -372,6 +373,56 @@ fn stop_handle_ends_run_as_ctrl_c() {
 
     let meta = read_meta(&outcome.run_dir);
     assert_eq!(meta["end_reason"], "ctrl_c");
+}
+
+#[test]
+fn duration_stops_the_run_like_ctrl_c() {
+    let dir = TempDir::new().expect("the temporary directory must be created");
+    let mut options = fixture_options(
+        &dir.path().join("runs"),
+        fixture_command(&["--duration", "60s"]),
+    );
+    options.duration = Some(Duration::from_secs(2));
+
+    let started = Instant::now();
+    let outcome = memwatch::run(&options, StopHandle::new()).expect("the run must finish");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "the run must stop by itself instead of waiting for the fixture: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        outcome.end_reason,
+        EndReason::CtrlC,
+        "the timer must end the run as Ctrl+C"
+    );
+    assert_eq!(
+        outcome.exit_code, None,
+        "no application exit code must be recorded"
+    );
+
+    let events = read_events(&outcome.run_dir.join("processes.csv"));
+    for pid in events
+        .iter()
+        .filter(|row| row.event == "start")
+        .map(|row| row.pid)
+    {
+        wait_until_dead(pid, Duration::from_secs(5));
+    }
+
+    let meta = read_meta(&outcome.run_dir);
+    assert_eq!(meta["end_reason"], "ctrl_c");
+    assert!(!meta["ended_at"].is_null(), "ended_at must be set");
+    let collectors = meta["collectors"]
+        .as_object()
+        .expect("collectors must be an object");
+    for name in ["process", "job", "system"] {
+        assert_eq!(
+            collectors.get(name),
+            Some(&serde_json::Value::from("ok")),
+            "{name} must finish ok"
+        );
+    }
 }
 
 #[test]

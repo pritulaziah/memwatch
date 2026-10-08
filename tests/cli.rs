@@ -173,6 +173,45 @@ fn cdp_port_is_accepted() {
 }
 
 #[test]
+fn duration_flag_stops_the_run() {
+    let dir = TempDir::new().expect("the temporary directory must be created");
+    let out = dir.path().join("runs");
+    let fixture = fixture_command(&["--duration", "60s"]);
+
+    let mut cmd = Command::new(MEMWATCH);
+    cmd.arg("run")
+        .arg("--name")
+        .arg("duration")
+        .arg("--out")
+        .arg(&out)
+        .arg("--duration")
+        .arg("2s")
+        .arg("--")
+        .args(&fixture);
+
+    let started = Instant::now();
+    let status = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("memwatch must run");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a run stopped by its duration must exit cleanly"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the duration must stop the run instead of waiting for the fixture: {:?}",
+        started.elapsed()
+    );
+
+    let run_dir = single_run_dir(&out);
+    let meta = read_meta(&run_dir);
+    assert_eq!(meta["end_reason"], "ctrl_c");
+}
+
+#[test]
 fn fixture_exit_code_is_not_propagated() {
     let dir = TempDir::new().expect("the temporary directory must be created");
     let out = dir.path().join("runs");
@@ -252,6 +291,55 @@ fn killed_memwatch_takes_tree_and_keeps_rows() {
     assert!(
         meta["ended_at"].is_null(),
         "a killed memwatch must not finalize meta.json"
+    );
+}
+
+#[test]
+fn report_missing_meta_json_exits_with_one() {
+    let dir = TempDir::new().expect("the temporary directory must be created");
+    let run_dir = dir.path().join("run");
+    fs::create_dir_all(&run_dir).expect("the directory must be created");
+
+    let output = Command::new(MEMWATCH)
+        .arg("report")
+        .arg(&run_dir)
+        .output()
+        .expect("memwatch must run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a run directory without meta.json must exit with 1"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("meta.json"),
+        "the error must name the missing file: {stderr}"
+    );
+}
+
+#[test]
+fn report_unknown_language_exits_with_two() {
+    let dir = TempDir::new().expect("the temporary directory must be created");
+    let run_dir = dir.path().join("run");
+    fs::create_dir_all(&run_dir).expect("the directory must be created");
+
+    let output = Command::new(MEMWATCH)
+        .arg("report")
+        .arg(&run_dir)
+        .args(["--lang", "de"])
+        .output()
+        .expect("memwatch must run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an unknown language must exit with 2"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--lang"),
+        "the error must name the offending flag: {stderr}"
     );
 }
 

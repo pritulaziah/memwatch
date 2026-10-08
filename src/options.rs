@@ -1,4 +1,4 @@
-//! Command-line option parsing for the `run` command.
+//! Command-line option parsing.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use time::OffsetDateTime;
 use time::macros::format_description;
+
+use crate::report::Lang;
 
 /// Resolved options of the `run` command.
 #[derive(Debug)]
@@ -19,6 +21,9 @@ pub struct RunOptions {
     pub labels: BTreeMap<String, String>,
     /// Sampling interval.
     pub interval: Duration,
+    /// Time after which the run stops by itself, like Ctrl+C; `None` runs
+    /// until the application exits.
+    pub duration: Option<Duration>,
     /// Interval of the GPU collector; a whole multiple of `interval`.
     pub gpu_interval: Duration,
     /// Interval of the DevTools collector; a whole multiple of `interval`.
@@ -62,6 +67,15 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         .checked_mul(millis_per_unit)
         .ok_or_else(|| format!("invalid duration `{s}`: value is too large"))?;
     Ok(Duration::from_millis(millis))
+}
+
+/// Parses the language of the report: `en` or `ru`.
+pub fn parse_lang(s: &str) -> Result<Lang, String> {
+    match s {
+        "en" => Ok(Lang::En),
+        "ru" => Ok(Lang::Ru),
+        _ => Err(format!("invalid language `{s}`: expected `en` or `ru`")),
+    }
 }
 
 /// Splits a `key=value` label on the first `=`.
@@ -158,6 +172,23 @@ mod tests {
     fn parse_duration_rejects_invalid() {
         for input in ["", "0s", "1", "1d", "-1s", "1.5s"] {
             assert!(parse_duration(input).is_err(), "`{input}` must be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_lang_accepts_en_and_ru() {
+        assert_eq!(parse_lang("en"), Ok(Lang::En));
+        assert_eq!(parse_lang("ru"), Ok(Lang::Ru));
+    }
+
+    #[test]
+    fn parse_lang_rejects_unknown() {
+        for input in ["de", "EN", ""] {
+            let error = parse_lang(input).expect_err("an unknown language must be rejected");
+            assert!(
+                error.contains("`en`") && error.contains("`ru`"),
+                "the error must name the allowed languages: {error}"
+            );
         }
     }
 

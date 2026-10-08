@@ -130,6 +130,26 @@ fn stdout_is_redirected_to_log() {
 }
 
 #[test]
+fn environment_override_reaches_the_launched_process() {
+    let dir = TempDir::new().expect("the temporary directory must be created");
+    let mut command = fixture_command("1s");
+    command.push(OsString::from("--echo-env"));
+    command.push(OsString::from("MEMWATCH_LAUNCH_TEST"));
+    let overrides =
+        BTreeMap::from([("MEMWATCH_LAUNCH_TEST".to_string(), "значение-✓".to_string())]);
+    let app = launch(&command, &overrides, dir.path()).expect("the fixture must launch");
+
+    wait_until_exited(&app.root, Duration::from_secs(10));
+
+    let content = fs::read_to_string(dir.path().join("app.stdout.log"))
+        .expect("the stdout log must be readable");
+    assert!(
+        content.contains("env MEMWATCH_LAUNCH_TEST=значение-✓"),
+        "`{content}` must contain the echoed override"
+    );
+}
+
+#[test]
 fn terminate_kills_whole_tree() {
     let dir = TempDir::new().expect("the temporary directory must be created");
     let app = start_fixture(&dir, "60s");

@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -100,6 +101,75 @@ fn bad_arguments_exit_with_two() {
             "{case}: bad arguments must exit with 2"
         );
     }
+}
+
+#[test]
+fn non_multiple_intervals_exit_with_two() {
+    let dir = TempDir::new().expect("the temporary directory must be created");
+    let out = dir.path().join("runs");
+    let fixture = fixture_command(&["--duration", "1s"]);
+
+    for flag in ["--gpu-interval", "--cdp-interval"] {
+        let mut cmd = Command::new(MEMWATCH);
+        cmd.args(["run", "--name", "non-multiple", "--out"])
+            .arg(&out)
+            .args(["--interval", "1s", flag, "1500ms", "--"])
+            .args(&fixture);
+
+        let output = cmd.output().expect("memwatch must run");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{flag}: bad arguments must exit with 2"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(flag),
+            "{flag}: the offending flag must be named: {stderr}"
+        );
+        assert!(
+            stderr.contains("multiple of --interval"),
+            "{flag}: the multiplicity requirement must be reported: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn cdp_port_is_accepted() {
+    let dir = TempDir::new().expect("the temporary directory must be created");
+    let out = dir.path().join("runs");
+    let port = free_port();
+    let fixture = fixture_command(&["--duration", "2s"]);
+
+    let mut cmd = Command::new(MEMWATCH);
+    cmd.arg("run")
+        .arg("--name")
+        .arg("cdp-port")
+        .arg("--out")
+        .arg(&out)
+        .arg("--cdp-port")
+        .arg(port.to_string())
+        .arg("--")
+        .args(&fixture);
+
+    let status = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("memwatch must run");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a run with a DevTools port must finish cleanly"
+    );
+
+    let run_dir = single_run_dir(&out);
+    let meta = read_meta(&run_dir);
+    assert_eq!(
+        meta["env_overrides"]["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"],
+        format!("--remote-debugging-port={port}"),
+        "the browser arguments must open the given port"
+    );
 }
 
 #[test]
@@ -223,6 +293,17 @@ fn read_process_records(path: &Path) -> (Vec<csv::StringRecord>, bool) {
         }
     }
     (records, torn)
+}
+
+/// Returns a loopback port that was free at the moment of the call.
+fn free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a free loopback port must be bound");
+    let port = listener
+        .local_addr()
+        .expect("the bound address must be readable")
+        .port();
+    drop(listener);
+    port
 }
 
 /// Returns the only run directory under `out`.

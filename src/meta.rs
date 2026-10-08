@@ -18,7 +18,7 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::core::PCWSTR;
 
-use crate::options::RunOptions;
+use crate::options::{RunOptions, cdp_env_overrides};
 use crate::win;
 
 /// Version of the run directory format.
@@ -72,8 +72,11 @@ pub struct Meta {
 impl Meta {
     /// Builds the metadata of a run that is about to start.
     ///
-    /// The end fields stay `None` and `env_overrides` stays empty; the
-    /// process, job and system collectors start as `ok`.
+    /// The end fields stay `None`; the process, job, system and gpu collectors
+    /// start as `ok`, while the DevTools collector starts as `waiting` with a
+    /// port and as `disabled` without one. `env_overrides` holds only the
+    /// browser arguments that open the DevTools port and is empty when no port
+    /// is given.
     pub fn new(opts: &RunOptions, started: OffsetDateTime, host: Host) -> Meta {
         let interval_ms = opts.interval.as_millis() as u64;
 
@@ -81,11 +84,22 @@ impl Meta {
         intervals_ms.insert("process".to_string(), interval_ms);
         intervals_ms.insert("job".to_string(), interval_ms);
         intervals_ms.insert("system".to_string(), interval_ms);
+        intervals_ms.insert("gpu".to_string(), opts.gpu_interval.as_millis() as u64);
+        intervals_ms.insert("cdp".to_string(), opts.cdp_interval.as_millis() as u64);
 
         let mut collectors = BTreeMap::new();
         collectors.insert("process".to_string(), CollectorStatus::Ok);
         collectors.insert("job".to_string(), CollectorStatus::Ok);
         collectors.insert("system".to_string(), CollectorStatus::Ok);
+        collectors.insert("gpu".to_string(), CollectorStatus::Ok);
+        collectors.insert(
+            "cdp".to_string(),
+            if opts.cdp_port.is_some() {
+                CollectorStatus::Waiting
+            } else {
+                CollectorStatus::Disabled
+            },
+        );
 
         Meta {
             schema_version: SCHEMA_VERSION,
@@ -107,7 +121,7 @@ impl Meta {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
-            env_overrides: BTreeMap::new(),
+            env_overrides: cdp_env_overrides(opts.cdp_port),
             intervals_ms,
             host,
             images: Vec::new(),
@@ -407,6 +421,9 @@ mod tests {
             out_dir: PathBuf::from("runs"),
             labels,
             interval: Duration::from_secs(1),
+            gpu_interval: Duration::from_secs(2),
+            cdp_interval: Duration::from_secs(10),
+            cdp_port: None,
             allow_sleep: false,
             command: vec![OsString::from("app.exe"), OsString::from("--no-devtools")],
         }
@@ -498,6 +515,16 @@ mod tests {
                 "{name} must tick every second"
             );
         }
+        assert_eq!(
+            intervals.get("gpu").and_then(serde_json::Value::as_u64),
+            Some(2000),
+            "gpu must tick every two seconds"
+        );
+        assert_eq!(
+            intervals.get("cdp").and_then(serde_json::Value::as_u64),
+            Some(10000),
+            "cdp must tick every ten seconds"
+        );
 
         let host = object["host"].as_object().expect("host must be an object");
         let mut host_keys: Vec<&str> = host.keys().map(String::as_str).collect();
@@ -519,7 +546,44 @@ mod tests {
                 .expect("every collector must have a status");
             assert_eq!(status, "ok", "{name} must start as ok");
         }
+        assert_eq!(
+            collectors.get("gpu"),
+            Some(&serde_json::json!("ok")),
+            "gpu must start as ok"
+        );
+        assert_eq!(
+            collectors.get("cdp"),
+            Some(&serde_json::json!("disabled")),
+            "cdp must start as disabled without a port"
+        );
         assert_eq!(object["tree_walk_fallback"], false);
+    }
+
+    #[test]
+    fn meta_marks_cdp_waiting_with_a_port() {
+        let mut opts = sample_options();
+        opts.cdp_port = Some(9222);
+        let meta = Meta::new(&opts, sample_started(), sample_host());
+
+        let value = serde_json::to_value(&meta).expect("the metadata must serialize");
+        let object = value.as_object().expect("the metadata must be an object");
+
+        assert_eq!(
+            object["collectors"]["cdp"], "waiting",
+            "cdp must wait for the DevTools port to come up"
+        );
+        assert_eq!(
+            object["env_overrides"],
+            serde_json::json!({
+                "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS": "--remote-debugging-port=9222"
+            }),
+            "the browser arguments must open the given port"
+        );
+        assert_eq!(
+            object["intervals_ms"]["cdp"].as_u64(),
+            Some(10000),
+            "cdp must tick every ten seconds"
+        );
     }
 
     #[test]

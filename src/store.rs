@@ -89,6 +89,43 @@ pub const SYSTEM_COLUMNS: &[&str] = &[
     "self_private_bytes",
 ];
 
+/// Column headers of `gpu.csv`.
+pub const GPU_COLUMNS: &[&str] = &[
+    "t_ms",
+    "unix_ms",
+    "proc_key",
+    "pid",
+    "dedicated_bytes",
+    "shared_bytes",
+    "committed_bytes",
+    "util_3d",
+    "util_copy",
+    "util_video_decode",
+    "util_video_encode",
+    "util_compute",
+    "util_other",
+];
+
+/// Column headers of `cdp.csv`.
+pub const CDP_COLUMNS: &[&str] = &[
+    "t_ms",
+    "unix_ms",
+    "target_id",
+    "url",
+    "js_heap_used_bytes",
+    "js_heap_total_bytes",
+    "nodes",
+    "documents",
+    "frames",
+    "js_event_listeners",
+    "layout_count",
+    "recalc_style_count",
+    "layout_duration_ms",
+    "recalc_style_duration_ms",
+    "script_duration_ms",
+    "task_duration_ms",
+];
+
 /// Creates the run directory `<out>/<name>-<YYYYMMDD-HHMMSS>`.
 ///
 /// Missing parents of `out` are created. Fails with
@@ -272,6 +309,83 @@ pub struct SystemRow {
     pub self_private_bytes: Option<u64>,
 }
 
+/// One row of `gpu.csv`: GPU memory and engine utilization of one process at
+/// one tick.
+///
+/// A `None` field means the value is unavailable and becomes an empty cell.
+#[derive(Debug, Serialize)]
+pub struct GpuRow {
+    /// Milliseconds since the start of the run.
+    pub t_ms: u64,
+    /// Unix time in milliseconds.
+    pub unix_ms: u64,
+    /// Stable process identity.
+    pub proc_key: String,
+    /// Process ID.
+    pub pid: u32,
+    /// Dedicated GPU memory in bytes.
+    pub dedicated_bytes: Option<u64>,
+    /// Shared GPU memory in bytes.
+    pub shared_bytes: Option<u64>,
+    /// Total committed GPU memory in bytes.
+    pub committed_bytes: Option<u64>,
+    /// 3D engine utilization percentage, formatted with two decimal places.
+    pub util_3d: Option<String>,
+    /// Copy engine utilization percentage, formatted with two decimal places.
+    pub util_copy: Option<String>,
+    /// Video decode engine utilization percentage, formatted with two decimal
+    /// places.
+    pub util_video_decode: Option<String>,
+    /// Video encode engine utilization percentage, formatted with two decimal
+    /// places.
+    pub util_video_encode: Option<String>,
+    /// Compute engine utilization percentage, formatted with two decimal
+    /// places.
+    pub util_compute: Option<String>,
+    /// Utilization percentage of engines of any other type, formatted with two
+    /// decimal places.
+    pub util_other: Option<String>,
+}
+
+/// One row of `cdp.csv`: JavaScript metrics of one page at one sample.
+///
+/// A `None` field means the metric was missing and becomes an empty cell.
+#[derive(Debug, Serialize)]
+pub struct CdpRow {
+    /// Milliseconds since the start of the run.
+    pub t_ms: u64,
+    /// Unix time in milliseconds.
+    pub unix_ms: u64,
+    /// DevTools target id of the page.
+    pub target_id: String,
+    /// URL of the page.
+    pub url: String,
+    /// Used JavaScript heap in bytes.
+    pub js_heap_used_bytes: Option<u64>,
+    /// Total JavaScript heap in bytes.
+    pub js_heap_total_bytes: Option<u64>,
+    /// DOM nodes in the page.
+    pub nodes: Option<u64>,
+    /// Documents in the page.
+    pub documents: Option<u64>,
+    /// Frames in the page.
+    pub frames: Option<u64>,
+    /// JavaScript event listeners in the page.
+    pub js_event_listeners: Option<u64>,
+    /// Layouts performed (cumulative).
+    pub layout_count: Option<u64>,
+    /// Style recalculations performed (cumulative).
+    pub recalc_style_count: Option<u64>,
+    /// Layout time in milliseconds (cumulative).
+    pub layout_duration_ms: Option<u64>,
+    /// Style recalculation time in milliseconds (cumulative).
+    pub recalc_style_duration_ms: Option<u64>,
+    /// Script execution time in milliseconds (cumulative).
+    pub script_duration_ms: Option<u64>,
+    /// Task execution time in milliseconds (cumulative).
+    pub task_duration_ms: Option<u64>,
+}
+
 /// An append-only CSV file with a fixed header row.
 pub struct CsvTable {
     writer: csv::Writer<fs::File>,
@@ -397,6 +511,45 @@ mod tests {
         }
     }
 
+    fn sample_gpu_row() -> GpuRow {
+        GpuRow {
+            t_ms: 1_000,
+            unix_ms: 1_700_000_000_000,
+            proc_key: "1234-133000000000000000".to_string(),
+            pid: 1234,
+            dedicated_bytes: Some(100_000_000),
+            shared_bytes: Some(50_000_000),
+            committed_bytes: None,
+            util_3d: Some("12.35".to_string()),
+            util_copy: None,
+            util_video_decode: Some("0.00".to_string()),
+            util_video_encode: None,
+            util_compute: None,
+            util_other: None,
+        }
+    }
+
+    fn sample_cdp_row() -> CdpRow {
+        CdpRow {
+            t_ms: 1_000,
+            unix_ms: 1_700_000_000_000,
+            target_id: "A1B2C3D4".to_string(),
+            url: "http://127.0.0.1:5173/".to_string(),
+            js_heap_used_bytes: Some(10_000_000),
+            js_heap_total_bytes: Some(20_000_000),
+            nodes: Some(1_500),
+            documents: Some(3),
+            frames: Some(2),
+            js_event_listeners: Some(450),
+            layout_count: Some(12),
+            recalc_style_count: Some(30),
+            layout_duration_ms: Some(125),
+            recalc_style_duration_ms: None,
+            script_duration_ms: Some(500),
+            task_duration_ms: None,
+        }
+    }
+
     fn round_trip<R: Serialize>(
         dir: &Path,
         file: &str,
@@ -488,6 +641,8 @@ mod tests {
             SYSTEM_COLUMNS,
             &sample_system_row(),
         );
+        check_row_matches_columns(dir.path(), "gpu.csv", GPU_COLUMNS, &sample_gpu_row());
+        check_row_matches_columns(dir.path(), "cdp.csv", CDP_COLUMNS, &sample_cdp_row());
     }
 
     #[test]

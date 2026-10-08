@@ -320,7 +320,7 @@ pub fn launch(
     let environment = if env_overrides.is_empty() {
         None
     } else {
-        Some(environment_block(env_overrides))
+        Some(environment_block(std::env::vars_os(), env_overrides))
     };
 
     let mut startup = STARTUPINFOEXW::default();
@@ -410,39 +410,60 @@ fn resume_thread(thread: HANDLE) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Builds a `CREATE_UNICODE_ENVIRONMENT` block from the current environment
-/// plus `overrides`.
+/// Builds a `CREATE_UNICODE_ENVIRONMENT` block from `base` plus `overrides`.
 ///
-/// An override replaces an existing variable case-insensitively; new names are
-/// appended. The block ends with an empty string (a double NUL).
-fn environment_block(overrides: &BTreeMap<String, String>) -> Vec<u16> {
-    let mut vars: Vec<(String, String)> = std::env::vars_os()
-        .map(|(name, value)| {
-            (
-                name.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            )
-        })
+/// An override replaces the value of the variable whose name matches it
+/// case-insensitively; new names are appended. Names and values are encoded
+/// with `OsStr::encode_wide`, so unpaired surrogates survive. The block ends
+/// with an empty string (a double NUL).
+fn environment_block(
+    base: impl Iterator<Item = (OsString, OsString)>,
+    overrides: &BTreeMap<String, String>,
+) -> Vec<u16> {
+    let mut vars: Vec<(Vec<u16>, Vec<u16>)> = base
+        .map(|(name, value)| (name.encode_wide().collect(), value.encode_wide().collect()))
         .collect();
+
     for (name, value) in overrides {
+        let name: Vec<u16> = name.encode_utf16().collect();
+        let value: Vec<u16> = value.encode_utf16().collect();
         match vars
             .iter_mut()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .find(|(key, _)| wide_eq_ignore_ascii_case(key, &name))
         {
-            Some((_, existing)) => *existing = value.clone(),
-            None => vars.push((name.clone(), value.clone())),
+            Some((_, existing)) => *existing = value,
+            None => vars.push((name, value)),
         }
     }
 
     let mut block = Vec::new();
     for (name, value) in vars {
-        block.extend(name.encode_utf16());
+        block.extend(name);
         block.push(u16::from(b'='));
-        block.extend(value.encode_utf16());
+        block.extend(value);
         block.push(0);
     }
     block.push(0);
     block
+}
+
+/// Compares two UTF-16 environment variable names case-insensitively.
+///
+/// Only ASCII letters are folded, matching how Windows compares environment
+/// variable names.
+fn wide_eq_ignore_ascii_case(left: &[u16], right: &[u16]) -> bool {
+    let lower = |unit: u16| {
+        if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
+            unit + u16::from(b'a' - b'A')
+        } else {
+            unit
+        }
+    };
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| lower(*left) == lower(*right))
 }
 
 /// An initialized process attribute list that deletes itself when dropped.
@@ -499,6 +520,7 @@ impl Drop for AttributeList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::ffi::OsStringExt;
 
     #[test]
     fn quote_command_line_follows_msvc_rules() {
@@ -519,5 +541,56 @@ mod tests {
             let line = String::from_utf16(&line).expect("the command line must be valid UTF-16");
             assert_eq!(line, expected, "`{args:?}` must be quoted per MSVC rules");
         }
+    }
+
+    #[test]
+    fn environment_block_keeps_unpaired_surrogates() {
+        let base = [(
+            OsString::from("EXOTIC"),
+            OsString::from_wide(&[0x41, 0xD800, 0x42]),
+        )];
+
+        let block = environment_block(base.into_iter(), &BTreeMap::new());
+
+        assert!(
+            block.contains(&0xD800),
+            "an unpaired surrogate must be encoded as is: {block:?}"
+        );
+        assert!(
+            !block.contains(&0xFFFD),
+            "the replacement character must not appear: {block:?}"
+        );
+        let tail = &block[block.len() - 2..];
+        assert_eq!(tail, &[0, 0][..], "the block must end with a double NUL");
+    }
+
+    #[test]
+    fn environment_block_replaces_overrides_case_insensitively() {
+        let base = [(OsString::from("Path"), OsString::from("old"))];
+        let overrides = BTreeMap::from([
+            ("path".to_string(), "new".to_string()),
+            ("NEW_VAR".to_string(), "added".to_string()),
+        ]);
+
+        let block = environment_block(base.into_iter(), &overrides);
+
+        let text = String::from_utf16(&block).expect("ASCII names must stay valid UTF-16");
+        assert!(
+            text.contains("Path=new\0"),
+            "the existing spelling must be kept and only the value replaced: {text:?}"
+        );
+        assert!(
+            !text.contains("Path=old"),
+            "the replaced value must be gone: {text:?}"
+        );
+        assert!(
+            text.contains("NEW_VAR=added\0"),
+            "a new override must be appended: {text:?}"
+        );
+        assert_eq!(
+            text.matches("Path=").count(),
+            1,
+            "the variable must not be duplicated: {text:?}"
+        );
     }
 }

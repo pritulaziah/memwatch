@@ -5,10 +5,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use memwatch::meta::EndReason;
-use memwatch::options::{RunOptions, parse_duration, parse_label, validate_name};
+use memwatch::options::{
+    RunOptions, parse_duration, parse_label, validate_intervals, validate_name,
+};
 use memwatch::sampler::StopHandle;
 
 /// Records resource usage of a tree of Windows processes while it runs.
@@ -45,6 +48,18 @@ struct RunArgs {
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
     interval: Duration,
 
+    /// Interval of the GPU collector; must be a multiple of `--interval`.
+    #[arg(long, default_value = "2s", value_parser = parse_duration)]
+    gpu_interval: Duration,
+
+    /// Interval of the DevTools collector; must be a multiple of `--interval`.
+    #[arg(long, default_value = "10s", value_parser = parse_duration)]
+    cdp_interval: Duration,
+
+    /// Port for DevTools opened by the launched application.
+    #[arg(long)]
+    cdp_port: Option<u16>,
+
     /// Allow the machine to sleep during the run.
     #[arg(long)]
     allow_sleep: bool,
@@ -61,6 +76,9 @@ impl From<RunArgs> for RunOptions {
             out_dir: args.out,
             labels: args.label.into_iter().collect(),
             interval: args.interval,
+            gpu_interval: args.gpu_interval,
+            cdp_interval: args.cdp_interval,
+            cdp_port: args.cdp_port,
             allow_sleep: args.allow_sleep,
             command: args.command,
         }
@@ -70,7 +88,16 @@ impl From<RunArgs> for RunOptions {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run(args) => run_command(args),
+        Command::Run(args) => {
+            if let Err(message) =
+                validate_intervals(args.interval, args.gpu_interval, args.cdp_interval)
+            {
+                Cli::command()
+                    .error(ErrorKind::ValueValidation, message)
+                    .exit();
+            }
+            run_command(args);
+        }
     }
 }
 

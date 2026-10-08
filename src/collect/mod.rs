@@ -4,6 +4,8 @@
 //! counted per collector, so a broken data source never stops the run, while
 //! a failed write to the run directory stops it.
 
+pub mod cdp;
+pub mod gpu;
 pub mod job;
 pub mod process;
 pub mod system;

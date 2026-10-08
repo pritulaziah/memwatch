@@ -124,6 +124,18 @@ pub fn select_pids(
     (pids, true)
 }
 
+/// Chooses the PIDs to start this tick.
+///
+/// A PID is kept when it is not in `tracked` yet and the snapshot already
+/// lists it, in the order of `pids`. A PID that appeared in the job list
+/// after the snapshot was taken is left out and retried on the next call.
+pub fn unstarted_pids(tracked: &[u32], pids: &[u32], snapshot: &[SnapshotEntry]) -> Vec<u32> {
+    pids.iter()
+        .copied()
+        .filter(|pid| !tracked.contains(pid) && snapshot.iter().any(|entry| entry.pid == *pid))
+        .collect()
+}
+
 /// One process tracked by a [`ProcessTree`].
 pub struct TrackedProcess {
     /// Stable identity `<pid>-<creation time>`.
@@ -256,10 +268,8 @@ impl ProcessTree {
         }
         self.tree_walk_fallback = fallback;
 
-        for pid in pids {
-            if self.processes.iter().any(|process| process.pid == pid) {
-                continue;
-            }
+        let tracked_pids: Vec<u32> = self.processes.iter().map(|process| process.pid).collect();
+        for pid in unstarted_pids(&tracked_pids, &pids, &snapshot) {
             let handle = match opened.remove(&pid) {
                 Some(handle) => Some(handle),
                 None => match ProcHandle::open(pid) {
@@ -796,5 +806,28 @@ mod tests {
             "an active fallback must keep the descendants even without outsiders"
         );
         assert!(fallback, "the fallback must stay active");
+    }
+
+    #[test]
+    fn unstarted_pids_skips_pids_missing_from_snapshot() {
+        let tracked = [1];
+        let pids = [1, 2, 3];
+        let snapshot = [entry(1, 0, 1, "root.exe"), entry(2, 1, 1, "child.exe")];
+        assert_eq!(
+            unstarted_pids(&tracked, &pids, &snapshot),
+            [2],
+            "a PID that is missing from the snapshot must not be started"
+        );
+
+        let snapshot = [
+            entry(1, 0, 1, "root.exe"),
+            entry(2, 1, 1, "child.exe"),
+            entry(3, 2, 1, "grandchild.exe"),
+        ];
+        assert_eq!(
+            unstarted_pids(&tracked, &pids, &snapshot),
+            [2, 3],
+            "a PID must be started once it appears in the snapshot"
+        );
     }
 }

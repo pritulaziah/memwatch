@@ -1,12 +1,13 @@
 //! Synthetic load process for the memwatch tests.
 //!
 //! Without `--child` the fixture starts a second copy of itself with the same
-//! load options and a zero exit code, prints the root and child PIDs, runs
-//! the load for `--duration`, waits for the child and exits with
-//! `--exit-code`. With `--child` it only runs the load. Every second the
-//! fixture allocates and fills `--alloc-mb-per-sec` megabytes and spins the
-//! CPU for `--busy-ms-per-sec` milliseconds; on the first second it creates
-//! `--gdi` GDI brushes. Everything allocated is held until the process exits.
+//! load options and a zero exit code, prints the root and child PIDs, echoes
+//! `--echo-env` if it is given, runs the load for `--duration`, waits for the
+//! child and exits with `--exit-code`. With `--child` it only runs the load.
+//! Every second the fixture allocates and fills `--alloc-mb-per-sec`
+//! megabytes and spins the CPU for `--busy-ms-per-sec` milliseconds; on the
+//! first second it creates `--gdi` GDI brushes. Everything allocated is held
+//! until the process exits.
 
 use std::io::Write;
 use std::os::windows::process::CommandExt;
@@ -47,6 +48,10 @@ struct FixtureArgs {
     /// Run as the child process instead of spawning one.
     #[arg(long)]
     child: bool,
+
+    /// Environment variable whose value is echoed before the child starts.
+    #[arg(long)]
+    echo_env: Option<String>,
 }
 
 fn main() {
@@ -57,11 +62,25 @@ fn main() {
         std::process::exit(args.exit_code);
     }
 
+    if let Some(name) = &args.echo_env {
+        echo_env(name);
+    }
+
     let mut child = spawn_child(&args);
     let load = run_load(&args);
     let _ = child.wait();
     std::hint::black_box(&load);
     std::process::exit(args.exit_code);
+}
+
+/// Prints one `env <NAME>=<VALUE>` line and flushes stdout.
+///
+/// The value is read from the process environment and is empty when the
+/// variable is not set.
+fn echo_env(name: &str) {
+    let value = std::env::var_os(name).unwrap_or_default();
+    println!("env {name}={}", value.to_string_lossy());
+    std::io::stdout().flush().expect("stdout must be flushed");
 }
 
 /// Starts a child copy with the same load options and a zero exit code.

@@ -13,16 +13,19 @@ use windows::Win32::System::Power::{
     ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
 };
 
+use crate::collect::cdp::CdpCollector;
+use crate::collect::gpu::GpuCollector;
 use crate::collect::job::JobCollector;
 use crate::collect::process::{ProcessCollector, ProcessTree};
 use crate::collect::system::SystemCollector;
 use crate::collect::{CollectError, Collector, FailureCounter, TickCtx};
 use crate::launch::{Launched, launch};
 use crate::log::RunLog;
-use crate::meta::{EndReason, Meta, host_info};
+use crate::meta::{CollectorStatus, EndReason, Meta, host_info};
 use crate::options::RunOptions;
 use crate::store::{
-    CsvTable, JOB_COLUMNS, PROCESS_COLUMNS, PROCESSES_COLUMNS, SYSTEM_COLUMNS, create_run_dir,
+    CDP_COLUMNS, CsvTable, GPU_COLUMNS, JOB_COLUMNS, PROCESS_COLUMNS, PROCESSES_COLUMNS,
+    SYSTEM_COLUMNS, create_run_dir,
 };
 
 /// How often the CSV files are synced to the storage device.
@@ -30,6 +33,9 @@ const FSYNC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long the tree is given to exit after the job is terminated.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the DevTools polling thread is given to stop after the run.
+const CDP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A handle that asks a run to stop.
 #[derive(Clone)]
@@ -143,24 +149,25 @@ pub fn run(opts: &RunOptions, stop: StopHandle) -> anyhow::Result<RunOutcome> {
         return Err(err.into());
     }
 
-    let (events, process_table, job_table, system_table) = match create_tables(&run_dir) {
-        Ok(tables) => tables,
-        Err(err) => {
-            log.error("sampler", format!("cannot create the CSV files: {err}"));
-            return Ok(finish_start_failure(
-                &log,
-                &mut meta,
-                &run_dir,
-                EndReason::MemwatchError,
-            ));
-        }
-    };
+    let (events, process_table, job_table, system_table, gpu_table, cdp_table) =
+        match create_tables(&run_dir) {
+            Ok(tables) => tables,
+            Err(err) => {
+                log.error("sampler", format!("cannot create the CSV files: {err}"));
+                return Ok(finish_start_failure(
+                    &log,
+                    &mut meta,
+                    &run_dir,
+                    EndReason::MemwatchError,
+                ));
+            }
+        };
 
     let Launched {
         job,
         root,
         root_pid,
-    } = match launch(&opts.command, &BTreeMap::new(), &run_dir) {
+    } = match launch(&opts.command, &meta.env_overrides, &run_dir) {
         Ok(launched) => launched,
         Err(err) => {
             log.error("launch", format!("cannot launch the application: {err}"));
@@ -173,15 +180,24 @@ pub fn run(opts: &RunOptions, stop: StopHandle) -> anyhow::Result<RunOutcome> {
         }
     };
 
+    let gpu_every_ticks = (opts.gpu_interval.as_millis() / opts.interval.as_millis()) as u32;
+    let cdp = match opts.cdp_port {
+        Some(port) => CdpCollector::start(port, opts.cdp_interval, started, cdp_table, log.clone()),
+        None => CdpCollector::disabled(cdp_table),
+    };
+
     let logical_cpus = meta.host.logical_cpus;
     let mut sampler = Sampler {
         tree: ProcessTree::new(job.clone(), root, root_pid, events, log.clone()),
         process: ProcessCollector::new(process_table, log.clone(), logical_cpus),
         job: JobCollector::new(job.clone(), job_table, logical_cpus),
         system: SystemCollector::new(system_table, logical_cpus),
+        gpu: GpuCollector::new(gpu_table, log.clone(), gpu_every_ticks),
         process_counter: FailureCounter::new(),
         job_counter: FailureCounter::new(),
         system_counter: FailureCounter::new(),
+        gpu_counter: FailureCounter::new(),
+        cdp,
         log: log.clone(),
     };
     let _keep_awake = KeepAwake::new(!opts.allow_sleep);
@@ -264,6 +280,20 @@ pub fn run(opts: &RunOptions, stop: StopHandle) -> anyhow::Result<RunOutcome> {
         end_reason = EndReason::MemwatchError;
     }
 
+    sampler.cdp.stop();
+    if !sampler.cdp.join(CDP_JOIN_TIMEOUT) {
+        log.error(
+            "cdp",
+            format!("the DevTools polling thread did not stop within {CDP_JOIN_TIMEOUT:?}"),
+        );
+    }
+
+    let gpu_status = if sampler.gpu.unavailable() {
+        CollectorStatus::Unavailable
+    } else {
+        sampler.gpu_counter.status()
+    };
+
     meta.ended_at = Some(now_rfc3339());
     meta.end_reason = Some(end_reason);
     meta.exit_code = exit_code;
@@ -272,6 +302,8 @@ pub fn run(opts: &RunOptions, stop: StopHandle) -> anyhow::Result<RunOutcome> {
         ("process".to_string(), sampler.process_counter.status()),
         ("job".to_string(), sampler.job_counter.status()),
         ("system".to_string(), sampler.system_counter.status()),
+        ("gpu".to_string(), gpu_status),
+        ("cdp".to_string(), sampler.cdp.status()),
     ]);
     meta.tree_walk_fallback = sampler.tree.tree_walk_fallback();
 
@@ -293,13 +325,17 @@ pub fn run(opts: &RunOptions, stop: StopHandle) -> anyhow::Result<RunOutcome> {
     })
 }
 
-/// Creates the four CSV files of the run with their headers.
-fn create_tables(run_dir: &Path) -> io::Result<(CsvTable, CsvTable, CsvTable, CsvTable)> {
+/// Creates the six CSV files of the run with their headers.
+fn create_tables(
+    run_dir: &Path,
+) -> io::Result<(CsvTable, CsvTable, CsvTable, CsvTable, CsvTable, CsvTable)> {
     Ok((
         CsvTable::create(&run_dir.join("processes.csv"), PROCESSES_COLUMNS)?,
         CsvTable::create(&run_dir.join("process.csv"), PROCESS_COLUMNS)?,
         CsvTable::create(&run_dir.join("job.csv"), JOB_COLUMNS)?,
         CsvTable::create(&run_dir.join("system.csv"), SYSTEM_COLUMNS)?,
+        CsvTable::create(&run_dir.join("gpu.csv"), GPU_COLUMNS)?,
+        CsvTable::create(&run_dir.join("cdp.csv"), CDP_COLUMNS)?,
     ))
 }
 
@@ -328,9 +364,12 @@ struct Sampler {
     process: ProcessCollector,
     job: JobCollector,
     system: SystemCollector,
+    gpu: GpuCollector,
     process_counter: FailureCounter,
     job_counter: FailureCounter,
     system_counter: FailureCounter,
+    gpu_counter: FailureCounter,
+    cdp: CdpCollector,
     log: RunLog,
 }
 
@@ -397,7 +436,7 @@ impl Sampler {
         }
     }
 
-    /// Samples the job and system collectors.
+    /// Samples the job, system and gpu collectors.
     ///
     /// With `scheduled_only` each collector runs only on the ticks of its
     /// schedule; otherwise every live collector runs.
@@ -424,6 +463,11 @@ impl Sampler {
         {
             sample_collector(&mut self.system, &mut self.system_counter, &self.log, &ctx)?;
         }
+        if !self.gpu_counter.is_failed()
+            && (!scheduled_only || tick.is_multiple_of(u64::from(self.gpu.every_ticks())))
+        {
+            sample_collector(&mut self.gpu, &mut self.gpu_counter, &self.log, &ctx)?;
+        }
         Ok(())
     }
 
@@ -433,6 +477,8 @@ impl Sampler {
         self.process.flush(durable)?;
         self.job.flush(durable)?;
         self.system.flush(durable)?;
+        self.gpu.flush(durable)?;
+        self.cdp.flush(durable)?;
         Ok(())
     }
 }

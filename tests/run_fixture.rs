@@ -4,12 +4,14 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
+use std::net::TcpListener;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use memwatch::meta::EndReason;
 use memwatch::options::{RunOptions, run_dir_name};
 use memwatch::sampler::StopHandle;
+use memwatch::store::{CDP_COLUMNS, GPU_COLUMNS};
 use memwatch::win::ProcHandle;
 use tempfile::TempDir;
 use time::OffsetDateTime;
@@ -31,6 +33,9 @@ fn fixture_options(out_dir: &Path, command: Vec<OsString>) -> RunOptions {
         out_dir: out_dir.to_path_buf(),
         labels: BTreeMap::new(),
         interval: Duration::from_secs(1),
+        gpu_interval: Duration::from_secs(2),
+        cdp_interval: Duration::from_secs(10),
+        cdp_port: None,
         allow_sleep: true,
         command,
     }
@@ -100,6 +105,8 @@ fn run_records_fixture_until_exit() {
         "processes.csv",
         "process.csv",
         "job.csv",
+        "gpu.csv",
+        "cdp.csv",
         "system.csv",
         "app.stdout.log",
         "app.stderr.log",
@@ -182,14 +189,151 @@ fn run_records_fixture_until_exit() {
         .expect("collectors must be an object");
     let mut names: Vec<&str> = collectors.keys().map(String::as_str).collect();
     names.sort_unstable();
-    assert_eq!(names, ["job", "process", "system"]);
-    for name in names {
+    assert_eq!(names, ["cdp", "gpu", "job", "process", "system"]);
+    for name in ["process", "job", "system"] {
         assert_eq!(
             collectors.get(name),
             Some(&serde_json::Value::from("ok")),
             "{name} must finish ok"
         );
     }
+    let gpu = collectors
+        .get("gpu")
+        .and_then(serde_json::Value::as_str)
+        .expect("gpu must have a status");
+    assert!(
+        matches!(gpu, "ok" | "unavailable"),
+        "gpu must finish ok or unavailable, got {gpu}"
+    );
+    assert_eq!(
+        collectors.get("cdp"),
+        Some(&serde_json::Value::from("disabled")),
+        "cdp must be disabled without a port"
+    );
+}
+
+#[test]
+fn default_run_creates_gpu_and_cdp_files() {
+    let dir = TempDir::new().expect("the temporary directory must be created");
+    let options = fixture_options(
+        &dir.path().join("runs"),
+        fixture_command(&["--duration", "5s"]),
+    );
+
+    let outcome = memwatch::run(&options, StopHandle::new()).expect("the run must finish");
+    assert_eq!(
+        outcome.end_reason,
+        EndReason::AppExited,
+        "the fixture must end by itself"
+    );
+
+    let run_dir = &outcome.run_dir;
+    let gpu_path = run_dir.join("gpu.csv");
+    assert!(
+        gpu_path.is_file(),
+        "gpu.csv must exist in the run directory"
+    );
+    let cdp_path = run_dir.join("cdp.csv");
+    assert!(
+        cdp_path.is_file(),
+        "cdp.csv must exist in the run directory"
+    );
+
+    let gpu_content = fs::read_to_string(&gpu_path).expect("gpu.csv must be readable");
+    let gpu_header = gpu_content
+        .lines()
+        .next()
+        .expect("gpu.csv must have a header line");
+    assert_eq!(
+        gpu_header,
+        GPU_COLUMNS.join(","),
+        "gpu.csv must start with the GPU columns"
+    );
+
+    let cdp_content = fs::read_to_string(&cdp_path).expect("cdp.csv must be readable");
+    assert_eq!(
+        cdp_content.lines().count(),
+        1,
+        "a disabled DevTools collector must leave only the header: {cdp_content:?}"
+    );
+    let cdp_header = CDP_COLUMNS.join(",");
+    assert_eq!(
+        cdp_content.lines().next(),
+        Some(cdp_header.as_str()),
+        "cdp.csv must start with the CDP columns"
+    );
+
+    let meta = read_meta(run_dir);
+    let collectors = meta["collectors"]
+        .as_object()
+        .expect("collectors must be an object");
+    let gpu = collectors
+        .get("gpu")
+        .and_then(serde_json::Value::as_str)
+        .expect("gpu must have a status");
+    assert!(
+        matches!(gpu, "ok" | "unavailable"),
+        "gpu must finish ok or unavailable, got {gpu}"
+    );
+    assert_eq!(
+        collectors.get("cdp"),
+        Some(&serde_json::Value::from("disabled")),
+        "cdp must be disabled without a port"
+    );
+    assert_eq!(
+        meta["intervals_ms"]["gpu"].as_u64(),
+        Some(2000),
+        "the GPU interval must be reported"
+    );
+    assert_eq!(
+        meta["intervals_ms"]["cdp"].as_u64(),
+        Some(10000),
+        "the DevTools interval must be reported"
+    );
+    assert_eq!(
+        meta["env_overrides"],
+        serde_json::json!({}),
+        "no port must mean no environment overrides"
+    );
+}
+
+#[test]
+fn unreachable_cdp_port_keeps_status_waiting() {
+    let dir = TempDir::new().expect("the temporary directory must be created");
+    let port = free_port();
+    let mut options = fixture_options(
+        &dir.path().join("runs"),
+        fixture_command(&["--duration", "5s"]),
+    );
+    options.cdp_interval = Duration::from_secs(1);
+    options.cdp_port = Some(port);
+
+    let outcome = memwatch::run(&options, StopHandle::new()).expect("the run must finish");
+    assert_eq!(
+        outcome.end_reason,
+        EndReason::AppExited,
+        "the fixture must end by itself"
+    );
+
+    let run_dir = &outcome.run_dir;
+    let meta = read_meta(run_dir);
+    assert_eq!(
+        meta["collectors"]["cdp"], "waiting",
+        "an unreachable DevTools port must keep the collector waiting"
+    );
+    assert_eq!(
+        meta["env_overrides"]["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"],
+        format!("--remote-debugging-port={port}"),
+        "the browser arguments must open the given port"
+    );
+
+    let cdp_content =
+        fs::read_to_string(run_dir.join("cdp.csv")).expect("cdp.csv must be readable");
+    assert_eq!(
+        cdp_content.lines().count(),
+        1,
+        "an unreachable DevTools port must leave only the header: {cdp_content:?}"
+    );
 }
 
 #[test]
@@ -259,6 +403,17 @@ fn run_dir_collision_is_an_error() {
             "the application must not start in a colliding run directory"
         );
     }
+}
+
+/// Returns a loopback port that was free at the moment of the call.
+fn free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a free loopback port must be bound");
+    let port = listener
+        .local_addr()
+        .expect("the bound address must be readable")
+        .port();
+    drop(listener);
+    port
 }
 
 /// Reads `process.csv` into row structs.

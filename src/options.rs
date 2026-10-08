@@ -19,6 +19,13 @@ pub struct RunOptions {
     pub labels: BTreeMap<String, String>,
     /// Sampling interval.
     pub interval: Duration,
+    /// Interval of the GPU collector; a whole multiple of `interval`.
+    pub gpu_interval: Duration,
+    /// Interval of the DevTools collector; a whole multiple of `interval`.
+    pub cdp_interval: Duration,
+    /// Port that the launched application opens for DevTools; `None` keeps it
+    /// closed.
+    pub cdp_port: Option<u16>,
     /// Whether the machine may sleep during the run.
     pub allow_sleep: bool,
     /// Command to run followed by its arguments.
@@ -94,6 +101,46 @@ pub fn run_dir_name(name: &str, started: OffsetDateTime) -> String {
     format!("{name}-{stamp}")
 }
 
+/// Checks that the GPU and DevTools intervals are whole multiples of the
+/// sampling interval.
+///
+/// The GPU interval is checked first, so when both are invalid the error
+/// names the GPU flag.
+pub fn validate_intervals(
+    interval: Duration,
+    gpu_interval: Duration,
+    cdp_interval: Duration,
+) -> Result<(), String> {
+    let interval_ms = interval.as_millis();
+    for (flag, value) in [
+        ("--gpu-interval", gpu_interval),
+        ("--cdp-interval", cdp_interval),
+    ] {
+        if value.as_millis() % interval_ms != 0 {
+            return Err(format!(
+                "{flag} must be a multiple of --interval: {}ms is not a whole multiple of {interval_ms}ms",
+                value.as_millis()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Builds the environment overrides for the launched application.
+///
+/// With a port the application receives `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`
+/// set to `--remote-debugging-port=<port>`; without one the map is empty.
+pub fn cdp_env_overrides(port: Option<u16>) -> BTreeMap<String, String> {
+    let mut overrides = BTreeMap::new();
+    if let Some(port) = port {
+        overrides.insert(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS".to_string(),
+            format!("--remote-debugging-port={port}"),
+        );
+    }
+    overrides
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +187,73 @@ mod tests {
     fn run_dir_name_formats_local_time() {
         let started = datetime!(2026-10-07 16:05:09 UTC);
         assert_eq!(run_dir_name("wry", started), "wry-20261007-160509");
+    }
+
+    #[test]
+    fn validate_intervals_accepts_multiples() {
+        assert_eq!(
+            validate_intervals(
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(10)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_intervals(
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+                Duration::from_secs(1)
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_intervals_rejects_non_multiples() {
+        let gpu_error = validate_intervals(
+            Duration::from_secs(1),
+            Duration::from_millis(1500),
+            Duration::from_secs(10),
+        )
+        .expect_err("a GPU interval that is not a whole multiple must be rejected");
+        assert!(
+            gpu_error.contains("--gpu-interval"),
+            "the error must name the GPU flag: {gpu_error}"
+        );
+
+        let cdp_error = validate_intervals(
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_millis(1500),
+        )
+        .expect_err("a DevTools interval that is not a whole multiple must be rejected");
+        assert!(
+            cdp_error.contains("--cdp-interval"),
+            "the error must name the DevTools flag: {cdp_error}"
+        );
+    }
+
+    #[test]
+    fn cdp_env_overrides_sets_browser_arguments() {
+        let overrides = cdp_env_overrides(Some(9222));
+        assert_eq!(
+            overrides.len(),
+            1,
+            "exactly one variable must be set: {overrides:?}"
+        );
+        assert_eq!(
+            overrides.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"),
+            Some(&"--remote-debugging-port=9222".to_string()),
+            "the browser arguments must open the given port"
+        );
+    }
+
+    #[test]
+    fn cdp_env_overrides_is_empty_without_port() {
+        assert!(
+            cdp_env_overrides(None).is_empty(),
+            "no port must mean no overrides"
+        );
     }
 }

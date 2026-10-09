@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::analyze::{
-    CdpTargetSummary, CpuPercentStats, CpuStats, MetricId, MetricStats, Run, RunReadError, Series,
-    Summary, Warning, WarningMessage, Window, WindowSummary, compute_warnings, load,
-    process_series, role_series, summarize,
+    CdpTargetSummary, CpuPercentStats, CpuStats, MetricId, MetricStats, ProcessSample, Run,
+    RunReadError, Series, Summary, Warning, WarningMessage, Window, WindowSummary,
+    compute_warnings, load, role_series, summarize,
 };
 use crate::meta::{CollectorStatus, ShutdownReason, ShutdownState};
 use crate::store::ProcessEvent;
@@ -79,6 +79,8 @@ pub struct ReportView {
     pub steady_state: WindowView,
     /// Cumulative CPU seconds and process lifecycle counters, shown once.
     pub totals_rows: Vec<Vec<String>>,
+    /// Scope and recording boundary of the kernel job totals.
+    pub job_scope: String,
     /// Independent CDP source tables in alphabetical target order.
     pub cdp_targets: Vec<CdpTargetView>,
     /// Rows of the role table, with peaks over the entire run.
@@ -113,6 +115,12 @@ struct Texts {
     empty_steady_data: &'static str,
     /// Explanation of the CPU percentage scale.
     cpu_scope: &'static str,
+    /// Distinguishes sampled summary peaks from kernel high-water marks.
+    sampled_scope: &'static str,
+    /// Scope and recording boundary of job counters.
+    job_scope: &'static str,
+    /// Extra scope note when tree walking also observes non-job processes.
+    job_fallback_scope: &'static str,
     /// Explanation of the scope of role and process peaks.
     whole_run_scope: &'static str,
     /// Explanation of CDP measurement attribution and the absence of totals.
@@ -153,6 +161,8 @@ struct Texts {
     process_headers: [&'static str; 8],
     /// Labels of the CPU table rows.
     cpu_rows: [&'static str; 7],
+    /// Labels of recorded job totals and the unobserved process lower bound.
+    job_rows: [&'static str; 4],
     /// Suffix marking CPU seconds summed over process rows.
     cpu_seconds_suffix: &'static str,
     /// Unit of memory values.
@@ -197,6 +207,8 @@ struct Texts {
     shutdown_reasons: [&'static str; 6],
     /// Text of a tree-walk fallback warning.
     warning_tree_walk_fallback: &'static str,
+    /// Template comparing kernel job count with observed process starts.
+    warning_unobserved_processes: &'static str,
     /// Template of an unexpected-end-reason warning.
     warning_unexpected_end_reason: &'static str,
     /// Template of a missing meta.json error.
@@ -226,7 +238,10 @@ const EN: Texts = Texts {
     empty_window: "No window after warmup",
     empty_steady_data: "No usable data after warmup",
     cpu_scope: "CPU %: 100% is the whole machine",
-    whole_run_scope: "Roles and process peaks cover the whole run",
+    sampled_scope: "Tree summary peaks are sampled maxima; kernel job peaks are shown in run totals.",
+    job_scope: "Job counters cover job members up to their last recorded sample, including short-lived processes. They are not final exit counts.",
+    job_fallback_scope: "Job counters may cover only part of the process tree in tree-walk fallback.",
+    whole_run_scope: "Role peaks are sampled concurrent sums over the whole run. Process peaks are kernel lifetime high-water marks up to each process's last recorded sample and must not be summed.",
     cdp_scope: "CDP targets are measurement sources; renderer/isolate scope may be shared. Values are not summed.",
     target_label: "CDP target {id}",
     samples_header: "Samples",
@@ -270,8 +285,8 @@ const EN: Texts = Texts {
     role_headers: [
         "Role",
         "Processes",
-        "Peak private bytes",
-        "Peak working set",
+        "Peak private bytes (sampled)",
+        "Peak working set (sampled)",
     ],
     process_headers: [
         "Role",
@@ -280,17 +295,23 @@ const EN: Texts = Texts {
         "Start",
         "End",
         "Duration",
-        "Peak private bytes",
-        "Peak working set",
+        "Peak private bytes (kernel)",
+        "Peak working set (kernel)",
     ],
     cpu_rows: [
         "CPU seconds",
         "CPU % mean",
         "CPU % p50",
         "CPU % p95",
-        "Processes started",
-        "Processes exited",
-        "Processes max concurrent",
+        "Processes started (observed)",
+        "Processes exited (observed)",
+        "Processes max concurrent (sampled)",
+    ],
+    job_rows: [
+        "Processes total (job, kernel)",
+        "Processes not observed",
+        "Job peak commit (kernel)",
+        "Peak process commit (job, kernel)",
     ],
     cpu_seconds_suffix: "(from processes)",
     memory_unit: "MB",
@@ -321,6 +342,7 @@ const EN: Texts = Texts {
         "wait timed out",
     ],
     warning_tree_walk_fallback: "processes left the job: tree walk enabled",
+    warning_unobserved_processes: "Process sampling missed at least {count} processes: job recorded {total}, observed starts {observed}",
     warning_unexpected_end_reason: "unexpected end reason: {reason}",
     error_missing_meta: "no meta.json in the run directory {dir}",
     error_unreadable_meta: "cannot read meta.json: {detail}",
@@ -343,7 +365,10 @@ const RU: Texts = Texts {
     empty_window: "Нет окна после прогрева",
     empty_steady_data: "Нет пригодных данных после прогрева",
     cpu_scope: "CPU %: 100% соответствует всей машине",
-    whole_run_scope: "Роли и пики процессов относятся ко всему прогону",
+    sampled_scope: "Пики в итогах по дереву — максимумы выборок; ядерные пики job показаны в общих итогах.",
+    job_scope: "Счётчики job учитывают процессы в job до последнего записанного замера, включая короткоживущие. Это не итоговое число завершений.",
+    job_fallback_scope: "При обходе дерева счётчики job могут учитывать только часть дерева процессов.",
+    whole_run_scope: "Пики ролей — максимумы одновременных сумм выборок за весь прогон. Пики процессов — ядерные максимумы за время жизни до последнего записанного замера каждого процесса; их нельзя суммировать.",
     cdp_scope: "CDP targets — источники измерений; область renderer/isolate может быть общей. Значения не суммируются.",
     target_label: "источник CDP {id}",
     samples_header: "Замеров",
@@ -393,7 +418,12 @@ const RU: Texts = Texts {
         "Разница медиан",
     ],
     cpu_headers: ["Показатель", "Значение"],
-    role_headers: ["Роль", "Процессов", "Пик private bytes", "Пик working set"],
+    role_headers: [
+        "Роль",
+        "Процессов",
+        "Пик private bytes (выборочный)",
+        "Пик working set (выборочный)",
+    ],
     process_headers: [
         "Роль",
         "Exe",
@@ -401,17 +431,23 @@ const RU: Texts = Texts {
         "Начало",
         "Конец",
         "Длительность",
-        "Пик private bytes",
-        "Пик working set",
+        "Пик private bytes (ядро)",
+        "Пик working set (ядро)",
     ],
     cpu_rows: [
         "CPU-секунды",
         "CPU % среднее",
         "CPU % p50",
         "CPU % p95",
-        "Процессов стартовало",
-        "Процессов завершилось",
-        "Процессов максимум одновременно",
+        "Процессов стартовало (наблюдённые)",
+        "Процессов завершилось (наблюдённые)",
+        "Процессов максимум одновременно (по замерам)",
+    ],
+    job_rows: [
+        "Процессов всего (job, ядро)",
+        "Ненаблюдённых процессов",
+        "Пик commit job (ядро)",
+        "Пик commit процесса (job, ядро)",
     ],
     cpu_seconds_suffix: "(по процессам)",
     memory_unit: "МБ",
@@ -442,6 +478,7 @@ const RU: Texts = Texts {
         "истекло время ожидания",
     ],
     warning_tree_walk_fallback: "процессы вышли из job: включён обход дерева",
+    warning_unobserved_processes: "Сборщик не наблюдал как минимум {count} процесса: job записал {total}, наблюдённых стартов {observed}",
     warning_unexpected_end_reason: "неожиданная причина завершения: {reason}",
     error_missing_meta: "нет файла meta.json в папке прогона {dir}",
     error_unreadable_meta: "не удалось прочитать meta.json: {detail}",
@@ -515,6 +552,11 @@ pub fn build(run: &Run, summary: &Summary, lang: Lang) -> ReportView {
             texts,
         ),
         totals_rows: totals_rows(summary, texts),
+        job_scope: if run.meta.tree_walk_fallback {
+            format!("{} {}", texts.job_scope, texts.job_fallback_scope)
+        } else {
+            texts.job_scope.to_string()
+        },
         cdp_targets: summary
             .cdp_targets
             .iter()
@@ -565,6 +607,8 @@ pub fn render(view: &ReportView) -> String {
     lines.push(String::new());
     lines.push(texts.cpu_scope.to_string());
     lines.push(String::new());
+    lines.push(texts.sampled_scope.to_string());
+    lines.push(String::new());
     for (heading, window, headers) in [
         (
             texts.heading_whole_run,
@@ -591,6 +635,8 @@ pub fn render(view: &ReportView) -> String {
         lines.push(String::new());
     }
     lines.push(format!("### {}", texts.heading_totals));
+    lines.push(String::new());
+    lines.push(view.job_scope.clone());
     lines.push(String::new());
     lines.extend(table(&texts.cpu_headers, &view.totals_rows));
     lines.push(String::new());
@@ -735,6 +781,18 @@ fn warning_text(warning: &Warning, lang: Lang) -> String {
             ],
         ),
         WarningMessage::TreeWalkFallback => texts.warning_tree_walk_fallback.to_string(),
+        WarningMessage::UnobservedProcesses {
+            count,
+            total,
+            observed,
+        } => fill(
+            texts.warning_unobserved_processes,
+            &[
+                ("count", &count.to_string()),
+                ("total", &total.to_string()),
+                ("observed", &observed.to_string()),
+            ],
+        ),
         WarningMessage::DidNotFinish => texts.did_not_finish.to_string(),
         WarningMessage::UnexpectedEndReason { reason } => {
             let reason = reason.to_string();
@@ -1145,7 +1203,32 @@ fn totals_rows(summary: &Summary, texts: &Texts) -> Vec<Vec<String>> {
             texts.cpu_rows[6].to_string(),
             processes.max_concurrent.to_string(),
         ],
+        vec![
+            texts.job_rows[0].to_string(),
+            unsigned_value(summary.job.total_processes, texts),
+        ],
+        vec![
+            texts.job_rows[1].to_string(),
+            unsigned_value(summary.job.unobserved_processes, texts),
+        ],
+        vec![
+            texts.job_rows[2].to_string(),
+            metric_value(summary.job.peak_commit_bytes, MetricKind::Memory, texts),
+        ],
+        vec![
+            texts.job_rows[3].to_string(),
+            metric_value(
+                summary.job.peak_process_commit_bytes,
+                MetricKind::Memory,
+                texts,
+            ),
+        ],
     ]
+}
+
+/// Formats an exact integer counter, or the no-data placeholder.
+fn unsigned_value(value: Option<u64>, texts: &Texts) -> String {
+    value.map_or_else(|| texts.no_data.to_string(), |value| value.to_string())
 }
 
 /// Formats total CPU seconds, marking a value summed over process rows.
@@ -1222,10 +1305,31 @@ fn peak_value(series: Option<&Series>, texts: &Texts) -> String {
     }
 }
 
+/// Finds kernel high-water marks directly, without summing timestamp ties.
+fn process_peak_values(
+    run: &Run,
+    value: impl Fn(&ProcessSample) -> Option<f64>,
+) -> BTreeMap<&str, f64> {
+    let mut peaks = BTreeMap::new();
+    for sample in &run.processes {
+        let Some(key) = sample.proc_key.as_deref().filter(|key| !key.is_empty()) else {
+            continue;
+        };
+        let Some(value) = value(sample) else {
+            continue;
+        };
+        peaks
+            .entry(key)
+            .and_modify(|peak| *peak = f64::max(*peak, value))
+            .or_insert(value);
+    }
+    peaks
+}
+
 /// Builds one process table row per `proc_key` in start event order.
 fn process_rows(run: &Run, texts: &Texts) -> Vec<Vec<String>> {
-    let private = process_series(run, |sample| sample.private_bytes);
-    let working = process_series(run, |sample| sample.working_set);
+    let private = process_peak_values(run, |sample| sample.peak_private_bytes);
+    let working = process_peak_values(run, |sample| sample.peak_working_set);
     let exits = exit_ticks(run);
     let mut seen = HashSet::new();
     let mut rows = Vec::new();
@@ -1254,8 +1358,8 @@ fn process_rows(run: &Run, texts: &Texts) -> Vec<Vec<String>> {
             duration_value(start_ms, texts),
             duration_value(end_ms, texts),
             elapsed_value(start_ms, end_ms, texts),
-            peak_value(find_series(&private, key), texts),
-            peak_value(find_series(&working, key), texts),
+            metric_value(private.get(key).copied(), MetricKind::Memory, texts),
+            metric_value(working.get(key).copied(), MetricKind::Memory, texts),
         ]);
     }
     rows
@@ -1407,6 +1511,8 @@ mod tests {
             role: Some(role.to_string()),
             private_bytes: Some(private_bytes),
             working_set: Some(working_set),
+            peak_private_bytes: Some(private_bytes),
+            peak_working_set: Some(working_set),
             cpu_user_ms: None,
             cpu_kernel_ms: None,
             cpu_pct: None,
@@ -2131,14 +2237,14 @@ mod tests {
                     "### After warmup",
                     EN.cpu_rows,
                     "CPU %: 100% is the whole machine",
-                    "Roles and process peaks cover the whole run",
+                    "Role peaks are sampled concurrent sums over the whole run",
                 ),
                 Lang::Ru => (
                     "### Весь прогон",
                     "### После прогрева",
                     RU.cpu_rows,
                     "CPU %: 100% соответствует всей машине",
-                    "Роли и пики процессов относятся ко всему прогону",
+                    "Пики ролей — максимумы одновременных сумм выборок за весь прогон",
                 ),
             };
             let whole = document_section(&document, whole);
@@ -2378,7 +2484,7 @@ mod tests {
         );
         assert_eq!(view.whole_run.cpu_rows.len(), 3);
         assert_eq!(view.steady_state.cpu_rows.len(), 3);
-        assert_eq!(view.totals_rows.len(), 4);
+        assert_eq!(view.totals_rows.len(), 8);
     }
 
     #[test]

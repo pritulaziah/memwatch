@@ -319,6 +319,298 @@ fn input_bytes(run_dir: &Path) -> BTreeMap<String, Vec<u8>> {
     .collect()
 }
 
+/// Creates a recording whose kernel totals include three unobserved processes.
+fn write_kernel_run(dir: &Path) -> PathBuf {
+    let run_dir = write_legacy_run(dir);
+    let mut events = Vec::new();
+    let mut samples = Vec::new();
+    for index in 0..8 {
+        let key = format!("{}-{}", 100 + index, 1000 + index);
+        let role = if index == 0 { "main" } else { "utility" };
+        for (t_ms, event) in [(0_u64, "start"), (1_200_000, "exit")] {
+            events.push(BTreeMap::from([
+                ("t_ms", t_ms.to_string()),
+                ("unix_ms", t_ms.to_string()),
+                ("event", event.to_string()),
+                ("proc_key", key.clone()),
+                ("role", role.to_string()),
+                ("image_path", format!(r"C:\app\{role}.exe")),
+            ]));
+            samples.push(BTreeMap::from([
+                ("t_ms", t_ms.to_string()),
+                ("unix_ms", t_ms.to_string()),
+                ("proc_key", key.clone()),
+                ("role", role.to_string()),
+                (
+                    "private_bytes",
+                    ((if index == 0 { 7 } else { 40 }) * 1_048_576_u64).to_string(),
+                ),
+                (
+                    "working_set",
+                    ((if index == 0 { 40 } else { 50 }) * 1_048_576_u64).to_string(),
+                ),
+                (
+                    "peak_private_bytes",
+                    (if index == 0 {
+                        166_772_736
+                    } else {
+                        45 * 1_048_576_u64
+                    })
+                    .to_string(),
+                ),
+                (
+                    "peak_working_set",
+                    (if index == 0 {
+                        155_873_280
+                    } else {
+                        55 * 1_048_576_u64
+                    })
+                    .to_string(),
+                ),
+            ]));
+        }
+    }
+    events.sort_by_key(|row| row["t_ms"].parse::<u64>().unwrap());
+    samples.sort_by_key(|row| row["t_ms"].parse::<u64>().unwrap());
+    write_named_csv(&run_dir.join("processes.csv"), PROCESSES_COLUMNS, &events);
+    write_named_csv(&run_dir.join("process.csv"), PROCESS_COLUMNS, &samples);
+    write_named_csv(
+        &run_dir.join("job.csv"),
+        JOB_COLUMNS,
+        &[
+            BTreeMap::from([
+                ("t_ms", "0".to_string()),
+                ("unix_ms", "0".to_string()),
+                ("total_processes", "8".to_string()),
+                ("peak_job_memory", "323530752".to_string()),
+                ("peak_process_memory", "166772736".to_string()),
+            ]),
+            BTreeMap::from([
+                ("t_ms", "1200000".to_string()),
+                ("unix_ms", "1200000".to_string()),
+                ("total_processes", "11".to_string()),
+                ("peak_job_memory", "341393408".to_string()),
+                ("peak_process_memory", "166772736".to_string()),
+            ]),
+            // Missing cells in a later sample must not discard known high-water marks.
+            BTreeMap::from([
+                ("t_ms", "1200001".to_string()),
+                ("unix_ms", "1200001".to_string()),
+            ]),
+        ],
+    );
+    run_dir
+}
+
+#[test]
+fn report_preserves_sampled_peaks_and_exposes_kernel_totals() {
+    let temp = TempDir::new().unwrap();
+    let run_dir = write_kernel_run(temp.path());
+    let before = input_bytes(&run_dir);
+    let document = legacy_report(&run_dir, &temp.path().join("kernel-report"), "en", None);
+
+    assert!(document.contains("| Job peak commit (kernel) | 325.6 MB |"));
+    assert!(document.contains("| Processes started (observed) | 8 |"));
+    assert!(document.contains("| Processes exited (observed) | 8 |"));
+    assert!(document.contains("| Processes max concurrent (sampled) | 8 |"));
+    assert!(document.contains("| Processes total (job, kernel) | 11 |"));
+    assert!(document.contains("| Processes not observed | 3 |"));
+    assert!(document.contains("| Peak process commit (job, kernel) | 159.0 MB |"));
+    assert!(document.contains("Process sampling missed at least 3 processes"));
+    assert!(document.contains("Peak private bytes (sampled)"));
+    assert!(document.contains("Peak private bytes (kernel)"));
+    assert!(
+        document.contains("| main | main.exe | — | 0:00 | 20:00 | 20:00 | 159.0 MB | 148.7 MB |")
+    );
+    assert!(document.contains("| utility | 7 | 280.0 MB | 350.0 MB |"));
+    assert!(document.contains("| Private bytes | 287.0 MB | 287.0 MB |"));
+    assert!(document.contains("Job counters cover job members up to their last recorded sample"));
+    assert_eq!(input_bytes(&run_dir), before);
+}
+
+#[test]
+fn report_localizes_kernel_totals_and_missed_processes() {
+    let temp = TempDir::new().unwrap();
+    let run_dir = write_kernel_run(temp.path());
+    let document = legacy_report(&run_dir, &temp.path().join("kernel-ru"), "ru", None);
+
+    assert!(document.contains("| Процессов стартовало (наблюдённые) | 8 |"));
+    assert!(document.contains("| Процессов завершилось (наблюдённые) | 8 |"));
+    assert!(document.contains("| Процессов всего (job, ядро) | 11 |"));
+    assert!(document.contains("| Ненаблюдённых процессов | 3 |"));
+    assert!(document.contains("| Пик commit job (ядро) | 325.6 МБ |"));
+    assert!(document.contains("Сборщик не наблюдал как минимум 3 процесса"));
+    assert!(document.contains("Пик private bytes (ядро)"));
+}
+
+#[test]
+fn report_does_not_invent_kernel_values_for_legacy_runs() {
+    let temp = TempDir::new().unwrap();
+    let run_dir = write_legacy_run(temp.path());
+    let document = legacy_report(&run_dir, &temp.path().join("without-kernel"), "en", None);
+
+    assert!(document.contains("| Processes total (job, kernel) | no data |"));
+    assert!(document.contains("| Processes not observed | no data |"));
+    assert!(document.contains("| Job peak commit (kernel) | no data |"));
+    assert!(
+        document.contains("| main | legacy.exe | — | 0:00 | 20:00 | 20:00 | no data | no data |")
+    );
+    assert!(!document.contains("Process sampling missed"));
+}
+
+#[test]
+fn report_does_not_claim_missed_processes_when_scopes_or_collectors_differ() {
+    let temp = TempDir::new().unwrap();
+    for (field, value) in [
+        ("tree_walk_fallback", serde_json::json!(true)),
+        ("end_reason", serde_json::json!("memwatch_error")),
+        ("job", serde_json::json!("failed: probe failure")),
+        ("process", serde_json::json!("failed: probe failure")),
+    ] {
+        let case = temp.path().join(field);
+        fs::create_dir(&case).unwrap();
+        let run_dir = write_kernel_run(&case);
+        let mut meta = read_meta(&run_dir);
+        if matches!(field, "job" | "process") {
+            meta["collectors"][field] = value;
+        } else {
+            meta[field] = value;
+        }
+        fs::write(
+            run_dir.join("meta.json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        let document = legacy_report(&run_dir, &case.join("report"), "en", None);
+
+        assert!(document.contains("| Processes total (job, kernel) | 11 |"));
+        assert!(document.contains("| Processes not observed | no data |"));
+        assert!(!document.contains("Process sampling missed"));
+        if field == "tree_walk_fallback" {
+            assert!(document.contains("Job counters may cover only part of the process tree"));
+        }
+    }
+}
+
+#[test]
+fn report_rejects_invalid_kernel_counters_without_substituting_sampled_peaks() {
+    let temp = TempDir::new().unwrap();
+    for cell in ["-1", "1.5", "NaN", "inf", "18446744073709551616"] {
+        let case = temp.path().join(cell);
+        fs::create_dir(&case).unwrap();
+        let run_dir = write_legacy_run(&case);
+        write_named_csv(
+            &run_dir.join("job.csv"),
+            JOB_COLUMNS,
+            &[BTreeMap::from([
+                ("t_ms", "0".to_string()),
+                ("unix_ms", "0".to_string()),
+                ("total_processes", cell.to_string()),
+                ("peak_job_memory", cell.to_string()),
+                ("peak_process_memory", cell.to_string()),
+            ])],
+        );
+        write_named_csv(
+            &run_dir.join("process.csv"),
+            PROCESS_COLUMNS,
+            &[BTreeMap::from([
+                ("t_ms", "0".to_string()),
+                ("unix_ms", "0".to_string()),
+                ("proc_key", "100-1000".to_string()),
+                ("private_bytes", "1048576".to_string()),
+                ("peak_private_bytes", cell.to_string()),
+                ("peak_working_set", cell.to_string()),
+            ])],
+        );
+        let document = legacy_report(&run_dir, &case.join("report"), "en", None);
+
+        assert!(document.contains("| Processes total (job, kernel) | no data |"));
+        assert!(document.contains("| Job peak commit (kernel) | no data |"));
+        assert!(document.contains("| Peak process commit (job, kernel) | no data |"));
+        assert!(
+            document
+                .contains("| main | legacy.exe | — | 0:00 | 20:00 | 20:00 | no data | no data |")
+        );
+        assert!(!document.contains("Process sampling missed"));
+    }
+}
+
+#[test]
+fn report_does_not_blame_sampling_for_silently_ignored_event_tails() {
+    let temp = TempDir::new().unwrap();
+    for (name, tail) in [
+        ("short", b"1,1,start,200-2000\n".as_slice()),
+        (
+            "parse-error",
+            b"1,1,start,200-2000,200,100,\xff\n".as_slice(),
+        ),
+    ] {
+        let case = temp.path().join(name);
+        fs::create_dir(&case).unwrap();
+        let run_dir = write_legacy_run(&case);
+        let mut events =
+            b"t_ms,unix_ms,event,proc_key,pid,ppid,role\n0,0,start,100-1000,100,0,main\n".to_vec();
+        events.extend_from_slice(tail);
+        fs::write(run_dir.join("processes.csv"), events).unwrap();
+        write_named_csv(
+            &run_dir.join("job.csv"),
+            JOB_COLUMNS,
+            &[BTreeMap::from([
+                ("t_ms", "1".to_string()),
+                ("unix_ms", "1".to_string()),
+                ("total_processes", "2".to_string()),
+            ])],
+        );
+        let samples: Vec<_> = ["100-1000", "200-2000"]
+            .into_iter()
+            .map(|key| {
+                BTreeMap::from([
+                    ("t_ms", "1".to_string()),
+                    ("unix_ms", "1".to_string()),
+                    ("proc_key", key.to_string()),
+                    ("private_bytes", "1048576".to_string()),
+                ])
+            })
+            .collect();
+        write_named_csv(&run_dir.join("process.csv"), PROCESS_COLUMNS, &samples);
+        let run = load(&run_dir).unwrap();
+        assert!(
+            !run.warnings.iter().any(|warning| matches!(
+                &warning.message,
+                WarningMessage::DroppedRows { file } | WarningMessage::NonNumericCells { file }
+                    if file == "processes.csv"
+            )),
+            "ignored tails must retain the existing silent-reading contract"
+        );
+        let document = legacy_report(&run_dir, &case.join("report"), "en", None);
+
+        assert!(document.contains("| Processes started (observed) | 1 |"));
+        assert!(document.contains("| Processes total (job, kernel) | 2 |"));
+        assert!(document.contains("| Processes not observed | no data |"));
+        assert!(!document.contains("Process sampling missed"));
+    }
+}
+
+#[test]
+fn report_takes_raw_kernel_maxima_on_timestamp_ties_and_missing_cells() {
+    let temp = TempDir::new().unwrap();
+    let run_dir = write_legacy_run(temp.path());
+    fs::write(
+        run_dir.join("process.csv"),
+        "t_ms,unix_ms,proc_key,role,peak_private_bytes,peak_working_set\n\
+         0,0,100-1000,main,1048576,3145728\n\
+         0,0,100-1000,main,2097152,4194304\n\
+         1,1,100-1000,main,,\n\
+         2,2,100-1000,main,-1,NaN\n",
+    )
+    .unwrap();
+    let document = legacy_report(&run_dir, &temp.path().join("tied-peaks"), "en", None);
+
+    assert!(
+        document.contains("| main | legacy.exe | — | 0:00 | 20:00 | 20:00 | 2.0 MB | 4.0 MB |")
+    );
+}
+
 /// Builds a CLI report in a separate temporary output directory.
 fn legacy_report(run_dir: &Path, out: &Path, lang: &str, warmup: Option<&str>) -> String {
     let mut command = Command::new(MEMWATCH);
@@ -615,8 +907,8 @@ fn report_renders_shutdown_issues_without_invented_exits() {
                     "Incomplete shutdown: PID 101, identity 101-1001, role renderer, state alive, reason wait timed out",
                     "End reason",
                     "Run totals",
-                    "Processes started",
-                    "Processes exited",
+                    "Processes started (observed)",
+                    "Processes exited (observed)",
                     "Processes",
                 )
             } else {
@@ -624,8 +916,8 @@ fn report_renders_shutdown_issues_without_invented_exits() {
                     "Неполная остановка: PID 101, идентичность 101-1001, роль renderer, состояние жив, причина истекло время ожидания",
                     "Причина завершения",
                     "Общие итоги прогона",
-                    "Процессов стартовало",
-                    "Процессов завершилось",
+                    "Процессов стартовало (наблюдённые)",
+                    "Процессов завершилось (наблюдённые)",
                     "Процессы",
                 )
             };

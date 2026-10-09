@@ -67,6 +67,10 @@ pub struct ProcessSample {
     pub private_bytes: Option<f64>,
     /// Working set in bytes.
     pub working_set: Option<f64>,
+    /// Kernel high-water mark of private commit over the process lifetime.
+    pub peak_private_bytes: Option<f64>,
+    /// Kernel high-water mark of working set over the process lifetime.
+    pub peak_working_set: Option<f64>,
     /// User CPU time in milliseconds (cumulative).
     pub cpu_user_ms: Option<f64>,
     /// Kernel CPU time in milliseconds (cumulative).
@@ -90,6 +94,12 @@ pub struct JobSample {
     pub t_ms: u64,
     /// Unix time in milliseconds.
     pub unix_ms: u64,
+    /// Processes ever associated with the job up to this sample.
+    pub total_processes: Option<u64>,
+    /// Kernel high-water mark of the job's committed memory in bytes.
+    pub peak_job_memory: Option<f64>,
+    /// Greatest kernel commit peak of any process associated with the job.
+    pub peak_process_memory: Option<f64>,
     /// User CPU time of the job in milliseconds (cumulative).
     pub cpu_user_ms: Option<f64>,
     /// Kernel CPU time of the job in milliseconds (cumulative).
@@ -164,6 +174,8 @@ pub enum WarningKind {
     CdpIdentity,
     /// A tracked process exit was not confirmed during shutdown.
     Shutdown,
+    /// The job recorded more processes than the process collector observed.
+    UnobservedProcesses,
 }
 
 /// Parameters of a [`Warning`], sufficient to render it in any language.
@@ -222,6 +234,15 @@ pub enum WarningMessage {
     },
     /// The process collector switched to walking the tree.
     TreeWalkFallback,
+    /// Comparable job accounting includes processes absent from start events.
+    UnobservedProcesses {
+        /// Lower bound on the number of unobserved processes.
+        count: u64,
+        /// Processes recorded by kernel job accounting.
+        total: u64,
+        /// Process starts recorded by the process collector.
+        observed: usize,
+    },
     /// The run did not finish.
     DidNotFinish,
     /// The run ended for an unexpected reason.
@@ -254,6 +275,8 @@ pub struct Run {
     pub images: Vec<ImageInfo>,
     /// Rows of `processes.csv`.
     pub events: Vec<Event>,
+    /// Whether lifecycle rows were read without dropped rows or ignored tails.
+    pub events_complete: bool,
     /// Rows of `process.csv`.
     pub processes: Vec<ProcessSample>,
     /// Rows of `job.csv`.
@@ -299,10 +322,10 @@ pub fn load(run_dir: &Path) -> Result<Run, RunReadError> {
     if !processes_path.is_file() {
         return Err(RunReadError::MissingProcesses);
     }
-    let events = match read_table(&processes_path, PROCESSES_NUMERIC) {
+    let (events, events_complete) = match read_table(&processes_path, PROCESSES_NUMERIC) {
         TableRead::Read(table) => {
             warnings.extend(table.read_warnings("processes.csv"));
-            events_from(&table)
+            (events_from(&table), table.complete)
         }
         TableRead::Missing | TableRead::WithoutHeader => {
             return Err(RunReadError::ProcessesWithoutHeader);
@@ -339,6 +362,7 @@ pub fn load(run_dir: &Path) -> Result<Run, RunReadError> {
         ended_at_recovered: false,
         images,
         events,
+        events_complete,
         processes,
         job,
         gpu,
@@ -458,6 +482,8 @@ struct Table {
     header: Vec<String>,
     /// Rows that passed validation.
     rows: Vec<TableRow>,
+    /// No structural/time validation failures or silently ignored parse tails.
+    complete: bool,
     /// Rows dropped because of a wrong field count, `t_ms` or `unix_ms`.
     dropped: usize,
     /// Non-numeric cells of numeric columns read as empty.
@@ -516,11 +542,14 @@ impl Table {
         self.cell(row, column).and_then(|cell| cell.parse().ok())
     }
 
+    /// Returns an unsigned integer cell, including zero, without rounding.
+    fn unsigned_u64(&self, row: &TableRow, column: &str) -> Option<u64> {
+        self.cell(row, column).and_then(|cell| cell.parse().ok())
+    }
+
     /// Returns a positive integer cell without converting through floating point.
     fn positive_u64(&self, row: &TableRow, column: &str) -> Option<u64> {
-        self.cell(row, column)
-            .and_then(|cell| cell.parse::<u64>().ok())
-            .filter(|value| *value > 0)
+        self.unsigned_u64(row, column).filter(|value| *value > 0)
     }
 }
 
@@ -605,10 +634,14 @@ fn read_table(path: &Path, numeric_columns: &[&str]) -> TableRead {
     let header: Vec<String> = header.iter().map(str::to_string).collect();
 
     let mut raw = Vec::new();
+    let mut complete = true;
     for record in records {
         match record {
             Ok(record) => raw.push(record),
-            Err(_) => break,
+            Err(_) => {
+                complete = false;
+                break;
+            }
         }
     }
 
@@ -633,6 +666,7 @@ fn read_table(path: &Path, numeric_columns: &[&str]) -> TableRead {
 
     for (position, record) in raw.iter().enumerate() {
         if record.len() != header.len() {
+            complete = false;
             if position != last {
                 dropped += 1;
             }
@@ -642,10 +676,12 @@ fn read_table(path: &Path, numeric_columns: &[&str]) -> TableRead {
         let t_ms = t_ms_index.and_then(|index| parse_int(&record[index]));
         let unix_ms = unix_ms_index.and_then(|index| parse_int(&record[index]));
         let (Some(t_ms), Some(unix_ms)) = (t_ms, unix_ms) else {
+            complete = false;
             dropped += 1;
             continue;
         };
         if previous_t_ms.is_some_and(|previous| t_ms < previous) {
+            complete = false;
             dropped += 1;
             continue;
         }
@@ -683,6 +719,7 @@ fn read_table(path: &Path, numeric_columns: &[&str]) -> TableRead {
     TableRead::Read(Table {
         header,
         rows,
+        complete,
         dropped,
         non_numeric,
     })
@@ -726,6 +763,12 @@ fn process_samples(table: &Table) -> Vec<ProcessSample> {
             role: table.text(row, "role"),
             private_bytes: table.number(row, "private_bytes"),
             working_set: table.number(row, "working_set"),
+            peak_private_bytes: table
+                .unsigned_u64(row, "peak_private_bytes")
+                .map(|value| value as f64),
+            peak_working_set: table
+                .unsigned_u64(row, "peak_working_set")
+                .map(|value| value as f64),
             cpu_user_ms: table.number(row, "cpu_user_ms"),
             cpu_kernel_ms: table.number(row, "cpu_kernel_ms"),
             cpu_pct: table.number(row, "cpu_pct"),
@@ -745,6 +788,13 @@ fn job_samples(table: &Table) -> Vec<JobSample> {
         .map(|row| JobSample {
             t_ms: row.t_ms,
             unix_ms: row.unix_ms,
+            total_processes: table.unsigned_u64(row, "total_processes"),
+            peak_job_memory: table
+                .unsigned_u64(row, "peak_job_memory")
+                .map(|value| value as f64),
+            peak_process_memory: table
+                .unsigned_u64(row, "peak_process_memory")
+                .map(|value| value as f64),
             cpu_user_ms: table.number(row, "cpu_user_ms"),
             cpu_kernel_ms: table.number(row, "cpu_kernel_ms"),
         })
@@ -1162,7 +1212,7 @@ pub struct CpuStats {
     pub from_process_rows: bool,
 }
 
-/// Process lifecycle counters of a run.
+/// Observed process lifecycle counters and sampled concurrency of a run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessStats {
     /// Number of `start` events.
@@ -1171,6 +1221,19 @@ pub struct ProcessStats {
     pub exited: usize,
     /// Greatest number of process rows on a tick.
     pub max_concurrent: usize,
+}
+
+/// Recorded kernel job totals, independent of sampled process-tree peaks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobStats {
+    /// Greatest recorded lifetime process count, not an exit count.
+    pub total_processes: Option<u64>,
+    /// Lower bound on missing starts; absent when job/tree scopes differ or fail.
+    pub unobserved_processes: Option<u64>,
+    /// Greatest recorded kernel job commit peak, never a sum of process peaks.
+    pub peak_commit_bytes: Option<f64>,
+    /// Greatest recorded kernel commit peak of a single job process.
+    pub peak_process_commit_bytes: Option<f64>,
 }
 
 /// Computed primary metrics and CPU percentages of one analysis window.
@@ -1216,8 +1279,10 @@ pub struct Summary {
     pub cdp_targets: Vec<CdpTargetSummary>,
     /// Cumulative CPU totals of the entire run, not sliced by either window.
     pub cpu: CpuStats,
-    /// Process lifecycle counters of the entire run.
+    /// Observed lifecycle counters and sampled concurrency of the entire run.
     pub processes: ProcessStats,
+    /// Kernel job accounting up to the recorded samples, scoped to job members.
+    pub job: JobStats,
 }
 
 /// Returns the linearly interpolated quantile of `values`, or `None` when the
@@ -1394,6 +1459,8 @@ pub fn summarize(run: &Run, window: Window, warmup_ms: u64) -> Summary {
         })
         .collect();
     let (total_seconds, from_process_rows) = cpu_seconds(run);
+    let processes = process_stats(run);
+    let job = job_stats(run, &processes);
     Summary {
         window,
         warmup_ms,
@@ -1405,7 +1472,8 @@ pub fn summarize(run: &Run, window: Window, warmup_ms: u64) -> Summary {
             total_seconds,
             from_process_rows,
         },
-        processes: process_stats(run),
+        processes,
+        job,
     }
 }
 
@@ -1603,6 +1671,43 @@ fn process_stats(run: &Run) -> ProcessStats {
     }
 }
 
+/// Keeps known cumulative job counters even when a later sample has empty cells.
+fn job_stats(run: &Run, processes: &ProcessStats) -> JobStats {
+    let total_processes = run.job.iter().filter_map(|row| row.total_processes).max();
+    let comparable = run.events_complete
+        && !run.meta.tree_walk_fallback
+        && run.meta.end_reason != Some(EndReason::MemwatchError)
+        && ["job", "process"].into_iter().all(|name| {
+            run.meta
+                .collectors
+                .get(name)
+                .is_none_or(|status| *status == CollectorStatus::Ok)
+        })
+        && !run.warnings.iter().any(|warning| {
+            matches!(
+                &warning.message,
+                WarningMessage::DroppedRows { file } | WarningMessage::NonNumericCells { file }
+                    if file == "processes.csv" || file == "job.csv"
+            )
+        });
+    JobStats {
+        total_processes,
+        unobserved_processes: total_processes
+            .filter(|_| comparable)
+            .and_then(|total| total.checked_sub(processes.started as u64)),
+        peak_commit_bytes: run
+            .job
+            .iter()
+            .filter_map(|row| row.peak_job_memory)
+            .reduce(f64::max),
+        peak_process_commit_bytes: run
+            .job
+            .iter()
+            .filter_map(|row| row.peak_process_memory)
+            .reduce(f64::max),
+    }
+}
+
 /// A wall-clock gap between neighbouring ticks above this threshold is a gap.
 const GAP_THRESHOLD_MS: u64 = 5_000;
 
@@ -1612,8 +1717,9 @@ const NOISE_THRESHOLD_PCT: f64 = 20.0;
 /// Collects the reading warnings of a run first, then the computed ones.
 ///
 /// The computed warnings follow in this order: wall-clock gaps, machine noise,
-/// collector statuses, CDP diagnostics, the tree-walk fallback, shutdown issues
-/// and the end reason. Identical messages preserve only their first occurrence.
+/// collector statuses, unobserved processes, CDP diagnostics, the tree-walk
+/// fallback, shutdown issues and the end reason. Identical messages preserve
+/// only their first occurrence.
 pub fn compute_warnings(run: &Run, summary: &Summary) -> Vec<Warning> {
     let mut warnings = run.warnings.clone();
     warnings.extend(time_gap_warnings(run, summary));
@@ -1621,6 +1727,19 @@ pub fn compute_warnings(run: &Run, summary: &Summary) -> Vec<Warning> {
         warnings.push(noisy);
     }
     warnings.extend(collector_status_warnings(run));
+    if let (Some(total), Some(count)) = (
+        summary.job.total_processes,
+        summary.job.unobserved_processes.filter(|count| *count > 0),
+    ) {
+        warnings.push(Warning {
+            kind: WarningKind::UnobservedProcesses,
+            message: WarningMessage::UnobservedProcesses {
+                count,
+                total,
+                observed: summary.processes.started,
+            },
+        });
+    }
     warnings.extend(cdp_data_warnings(run, summary));
     if run.meta.tree_walk_fallback {
         warnings.push(Warning {
@@ -1939,6 +2058,7 @@ pub(crate) mod fixtures {
             ended_at_recovered: false,
             images,
             events: Vec::new(),
+            events_complete: true,
             processes: Vec::new(),
             job: Vec::new(),
             gpu: Vec::new(),
@@ -2030,6 +2150,11 @@ pub(crate) mod fixtures {
                     ("role", "main".to_string()),
                     ("private_bytes", (100_000_000 + t_ms * 1000).to_string()),
                     ("working_set", (120_000_000 + t_ms * 1000).to_string()),
+                    (
+                        "peak_private_bytes",
+                        (100_000_000 + t_ms * 1000).to_string(),
+                    ),
+                    ("peak_working_set", (120_000_000 + t_ms * 1000).to_string()),
                     ("cpu_user_ms", (t_ms * 2).to_string()),
                     ("cpu_kernel_ms", t_ms.to_string()),
                     ("cpu_pct", "2.00".to_string()),
@@ -2049,6 +2174,8 @@ pub(crate) mod fixtures {
                     ("role", "renderer".to_string()),
                     ("private_bytes", (50_000_000 + t_ms * 500).to_string()),
                     ("working_set", (70_000_000 + t_ms * 500).to_string()),
+                    ("peak_private_bytes", (50_000_000 + t_ms * 500).to_string()),
+                    ("peak_working_set", (70_000_000 + t_ms * 500).to_string()),
                     ("cpu_user_ms", t_ms.to_string()),
                     ("cpu_kernel_ms", (t_ms / 2).to_string()),
                     ("cpu_pct", "1.00".to_string()),
@@ -2178,6 +2305,106 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn load_kernel_counters_keeps_zero_and_exact_integer_counts() {
+        let dir = TempDir::new().expect("the temporary directory must be created");
+        let run_dir = fixtures::write_run(dir.path());
+        fs::write(
+            run_dir.join("job.csv"),
+            "t_ms,unix_ms,total_processes,peak_job_memory,peak_process_memory\n\
+             0,0,9007199254740993,0,0\n\
+             1,1,18446744073709551615,1024,2048\n\
+             2,2,0,0,0\n\
+             3,3,1.5,-1,NaN\n",
+        )
+        .expect("job.csv must be written");
+
+        let run = load(&run_dir).expect("the run must load");
+
+        assert_eq!(run.job[0].total_processes, Some(9_007_199_254_740_993));
+        assert_eq!(run.job[1].total_processes, Some(u64::MAX));
+        assert_eq!(run.job[2].total_processes, Some(0));
+        assert_eq!(run.job[0].peak_job_memory, Some(0.0));
+        assert_eq!(run.job[1].peak_process_memory, Some(2048.0));
+        assert_eq!(run.job[3].total_processes, None);
+        assert_eq!(run.job[3].peak_job_memory, None);
+        assert_eq!(run.job[3].peak_process_memory, None);
+    }
+
+    #[test]
+    fn job_count_warning_requires_a_positive_comparable_discrepancy() {
+        let mut run = fixtures::empty_run();
+        run.events = vec![
+            event_sample(0, ProcessEvent::Start),
+            event_sample(0, ProcessEvent::Start),
+        ];
+        run.job = vec![job_sample(0, None, None)];
+        for (total, expected) in [
+            (None, None),
+            (Some(1), None),
+            (Some(2), Some(0)),
+            (Some(3), Some(1)),
+        ] {
+            run.job[0].total_processes = total;
+            let summary = summarize(
+                &run,
+                Window {
+                    start_ms: 0,
+                    end_ms: 0,
+                },
+                0,
+            );
+
+            assert_eq!(summary.job.unobserved_processes, expected);
+            assert_eq!(
+                compute_warnings(&run, &summary)
+                    .iter()
+                    .any(|warning| warning.kind == WarningKind::UnobservedProcesses),
+                expected.is_some_and(|value| value > 0),
+            );
+        }
+    }
+
+    #[test]
+    fn damaged_job_or_event_files_do_not_claim_sampling_losses() {
+        let mut run = fixtures::empty_run();
+        let mut job = job_sample(0, None, None);
+        job.total_processes = Some(3);
+        run.job = vec![job];
+        run.events = vec![event_sample(0, ProcessEvent::Start)];
+        for file in ["job.csv", "processes.csv"] {
+            for message in [
+                WarningMessage::DroppedRows {
+                    file: file.to_string(),
+                },
+                WarningMessage::NonNumericCells {
+                    file: file.to_string(),
+                },
+            ] {
+                run.warnings = vec![Warning {
+                    kind: WarningKind::DroppedRow,
+                    message,
+                }];
+                let summary = summarize(
+                    &run,
+                    Window {
+                        start_ms: 0,
+                        end_ms: 0,
+                    },
+                    0,
+                );
+
+                assert_eq!(summary.job.total_processes, Some(3));
+                assert_eq!(summary.job.unobserved_processes, None);
+                assert!(
+                    !compute_warnings(&run, &summary)
+                        .iter()
+                        .any(|warning| warning.kind == WarningKind::UnobservedProcesses)
+                );
+            }
+        }
+    }
 
     #[test]
     fn load_cdp_preserves_target_and_session_identity() {
@@ -3094,6 +3321,8 @@ mod tests {
             role: Some(role.to_string()),
             private_bytes,
             working_set: None,
+            peak_private_bytes: None,
+            peak_working_set: None,
             cpu_user_ms: None,
             cpu_kernel_ms: None,
             cpu_pct: None,
@@ -4507,6 +4736,8 @@ mod tests {
             role: Some(role.to_string()),
             private_bytes: None,
             working_set: None,
+            peak_private_bytes: None,
+            peak_working_set: None,
             cpu_user_ms: None,
             cpu_kernel_ms: None,
             cpu_pct: None,
@@ -4522,6 +4753,9 @@ mod tests {
         JobSample {
             t_ms,
             unix_ms: t_ms,
+            total_processes: None,
+            peak_job_memory: None,
+            peak_process_memory: None,
             cpu_user_ms,
             cpu_kernel_ms,
         }

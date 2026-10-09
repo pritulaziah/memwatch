@@ -68,7 +68,7 @@ struct RunArgs {
     label: Vec<(String, String)>,
 
     /// Sampling interval.
-    #[arg(long, default_value = "1s", value_parser = parse_duration)]
+    #[arg(long, default_value = "500ms", value_parser = parse_duration)]
     interval: Duration,
 
     /// Stop the run after this time (like Ctrl+C).
@@ -218,5 +218,84 @@ fn end_reason_name(reason: EndReason) -> &'static str {
         EndReason::CtrlC => "ctrl_c",
         EndReason::LaunchFailed => "launch_failed",
         EndReason::MemwatchError => "memwatch_error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_defaults_to_500ms_with_unchanged_collector_intervals() {
+        let cli = Cli::try_parse_from(["memwatch", "run", "--name", "defaults", "--", "app.exe"])
+            .expect("the run arguments must parse");
+        let Command::Run(args) = cli.command else {
+            panic!("the run command must be parsed");
+        };
+
+        assert_eq!(args.interval, Duration::from_millis(500));
+        assert_eq!(args.gpu_interval, Duration::from_secs(2));
+        assert_eq!(args.cdp_interval, Duration::from_secs(10));
+        assert_eq!(
+            validate_intervals(args.interval, args.gpu_interval, args.cdp_interval),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn run_accepts_an_explicit_one_second_interval() {
+        let cli = Cli::try_parse_from([
+            "memwatch",
+            "run",
+            "--name",
+            "override",
+            "--interval",
+            "1s",
+            "--",
+            "app.exe",
+        ])
+        .expect("the run arguments must parse");
+        let Command::Run(args) = cli.command else {
+            panic!("the run command must be parsed");
+        };
+
+        assert_eq!(args.interval, Duration::from_secs(1));
+        assert_eq!(args.gpu_interval, Duration::from_secs(2));
+        assert_eq!(args.cdp_interval, Duration::from_secs(10));
+        assert_eq!(
+            validate_intervals(args.interval, args.gpu_interval, args.cdp_interval),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn run_default_interval_rejects_non_multiple_collector_intervals() {
+        for flag in ["--gpu-interval", "--cdp-interval"] {
+            let cli = Cli::try_parse_from([
+                "memwatch",
+                "run",
+                "--name",
+                "non-multiple",
+                flag,
+                "750ms",
+                "--",
+                "app.exe",
+            ])
+            .expect("the run arguments must parse");
+            let Command::Run(args) = cli.command else {
+                panic!("the run command must be parsed");
+            };
+
+            let error = validate_intervals(args.interval, args.gpu_interval, args.cdp_interval)
+                .expect_err("a collector interval that is not a whole multiple must be rejected");
+            assert!(
+                error.contains(flag),
+                "the error must name the offending flag: {error}"
+            );
+            assert!(
+                error.contains("multiple of --interval"),
+                "the error must report the multiplicity requirement: {error}"
+            );
+        }
     }
 }

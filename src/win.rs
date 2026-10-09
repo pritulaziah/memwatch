@@ -11,6 +11,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::meta::ShutdownReason;
 use anyhow::anyhow;
 use windows::Wdk::System::Threading::{
     NtQueryInformationProcess, ProcessBasicInformation, ProcessCommandLineInformation,
@@ -34,13 +35,113 @@ use windows::Win32::System::ProcessStatus::{
 use windows::Win32::System::Threading::{
     ALL_PROCESSOR_GROUPS, GET_GUI_RESOURCES_FLAGS, GR_GDIOBJECTS, GR_GDIOBJECTS_PEAK,
     GR_USEROBJECTS, GR_USEROBJECTS_PEAK, GetActiveProcessorCount, GetCurrentProcess,
-    GetExitCodeProcess, GetGuiResources, GetProcessHandleCount, GetProcessIoCounters,
+    GetExitCodeProcess, GetGuiResources, GetProcessHandleCount, GetProcessId, GetProcessIoCounters,
     GetProcessTimes, IO_COUNTERS, OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
-    WaitForSingleObject,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::System::WindowsProgramming::QueryProcessCycleTime;
 use windows::core::{HRESULT, PCWSTR, PWSTR};
+
+/// The observed state of the original process handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessState {
+    /// The process has not signaled completion.
+    Running,
+    /// The process has signaled completion, with a best-effort exit code.
+    Exited(Option<u32>),
+}
+
+/// A rejected or failed identity-checked termination attempt.
+#[derive(Debug)]
+pub struct TerminationError {
+    /// Stable diagnostic code for the failure.
+    pub reason: ShutdownReason,
+    /// Detailed error for the run log.
+    pub detail: String,
+}
+
+impl std::fmt::Display for TerminationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for TerminationError {}
+
+fn classify_process_state(
+    wait_result: u32,
+    exit_code: Option<u32>,
+) -> anyhow::Result<ProcessState> {
+    match wait_result {
+        value if value == WAIT_OBJECT_0.0 => Ok(ProcessState::Exited(exit_code)),
+        value if value == WAIT_TIMEOUT.0 => Ok(ProcessState::Running),
+        other => Err(anyhow!("WaitForSingleObject failed: {other:#x}")),
+    }
+}
+
+fn terminate_with<H>(
+    pid: u32,
+    creation_time: u64,
+    exit_code: u32,
+    open: impl FnOnce(u32) -> anyhow::Result<Option<H>>,
+    identity: impl FnOnce(&H) -> anyhow::Result<(u32, u64)>,
+    terminate: impl FnOnce(&H, u32) -> anyhow::Result<()>,
+) -> Result<(), TerminationError> {
+    if creation_time == 0 {
+        return Err(TerminationError {
+            reason: ShutdownReason::IdentityUnknown,
+            detail: "process creation identity is unknown".into(),
+        });
+    }
+    let candidate = open(pid)
+        .map_err(|err| TerminationError {
+            reason: if is_access_denied(&err) {
+                ShutdownReason::AccessDenied
+            } else {
+                ShutdownReason::QueryFailed
+            },
+            detail: format!("cannot open PID {pid} for termination: {err:#}"),
+        })?
+        .ok_or_else(|| TerminationError {
+            reason: ShutdownReason::IdentityChanged,
+            detail: format!("PID {pid} vanished before termination"),
+        })?;
+    let actual = identity(&candidate).map_err(|err| TerminationError {
+        reason: ShutdownReason::QueryFailed,
+        detail: format!("cannot read termination handle identity: {err:#}"),
+    })?;
+    if actual != (pid, creation_time) {
+        return Err(TerminationError {
+            reason: ShutdownReason::IdentityChanged,
+            detail: format!("termination handle identity changed for PID {pid}"),
+        });
+    }
+    terminate(&candidate, exit_code).map_err(|err| TerminationError {
+        reason: ShutdownReason::TerminateFailed,
+        detail: format!("cannot terminate PID {pid}: {err:#}"),
+    })
+}
+
+fn open_for_termination(pid: u32) -> anyhow::Result<Option<ProcHandle>> {
+    // SAFETY: the fresh, non-inheritable handle is owned and checked before termination.
+    match unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+    } {
+        Ok(handle) => Ok(Some(ProcHandle(unsafe { OwnedHandle::new(handle) }))),
+        Err(err)
+            if err.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0)
+                || err.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
 
 /// An owned Win32 handle that is closed with `CloseHandle` when dropped.
 ///
@@ -103,6 +204,75 @@ impl Drop for OwnedHandle {
 pub struct ProcHandle(OwnedHandle);
 
 impl ProcHandle {
+    /// Returns the process ID belonging to this handle.
+    pub fn pid(&self) -> anyhow::Result<u32> {
+        // SAFETY: this owned process handle is valid.
+        let pid = unsafe { GetProcessId(self.raw()) };
+        if pid == 0 {
+            return Err(windows::core::Error::from_thread().into());
+        }
+        Ok(pid)
+    }
+
+    /// Observes completion independently of whether the exit code can be read.
+    pub fn state(&self) -> anyhow::Result<ProcessState> {
+        // SAFETY: the original handle grants synchronization access.
+        let wait = unsafe { WaitForSingleObject(self.raw(), 0) };
+        let code = if wait == WAIT_OBJECT_0 {
+            let mut code = 0;
+            // SAFETY: the output points to writable storage; failure does not erase the signal.
+            unsafe { GetExitCodeProcess(self.raw(), &mut code) }
+                .ok()
+                .map(|()| code)
+        } else {
+            None
+        };
+        classify_process_state(wait.0, code)
+    }
+
+    /// Attempts termination only after verifying the original and fresh handle identities.
+    pub fn terminate_verified(
+        &self,
+        pid: u32,
+        creation_time: u64,
+        exit_code: u32,
+    ) -> Result<(), TerminationError> {
+        if creation_time == 0 {
+            return Err(TerminationError {
+                reason: ShutdownReason::IdentityUnknown,
+                detail: "original process creation identity is unknown".into(),
+            });
+        }
+        let original =
+            (|| Ok::<_, anyhow::Error>((self.pid()?, self.creation_time()?, self.state()?)))()
+                .map_err(|err| TerminationError {
+                    reason: ShutdownReason::QueryFailed,
+                    detail: format!("cannot verify original process handle: {err:#}"),
+                })?;
+        if (original.0, original.1) != (pid, creation_time) {
+            return Err(TerminationError {
+                reason: ShutdownReason::IdentityChanged,
+                detail: "original process handle identity changed".into(),
+            });
+        }
+        if matches!(original.2, ProcessState::Exited(_)) {
+            return Ok(());
+        }
+        terminate_with(
+            pid,
+            creation_time,
+            exit_code,
+            open_for_termination,
+            |handle| Ok((handle.pid()?, handle.creation_time()?)),
+            |handle, code| {
+                // SAFETY: terminate_with checked identity on this exact fresh handle.
+                unsafe {
+                    TerminateProcess(handle.raw(), code)?;
+                }
+                Ok(())
+            },
+        )
+    }
     /// Opens `pid` with `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE`.
     ///
     /// Returns `Ok(None)` when the process is gone (the PID no longer maps to
@@ -587,6 +757,123 @@ mod tests {
 
     use windows::Win32::Foundation::COLORREF;
     use windows::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, HGDIOBJ};
+
+    #[test]
+    fn verified_termination_rejects_changed_identity() {
+        let called = std::cell::Cell::new(false);
+        let err = terminate_with(
+            12,
+            100,
+            1,
+            |_| Ok(Some((12, 101))),
+            |h| Ok(*h),
+            |_, _| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.reason, ShutdownReason::IdentityChanged);
+        assert!(!called.get());
+        let err = terminate_with(
+            12,
+            100,
+            1,
+            |_| Ok(Some((13, 100))),
+            |h| Ok(*h),
+            |_, _| panic!("replacement must not terminate"),
+        )
+        .unwrap_err();
+        assert_eq!(err.reason, ShutdownReason::IdentityChanged);
+    }
+
+    #[test]
+    fn verified_termination_rejects_unknown_identity() {
+        let err = terminate_with::<()>(
+            12,
+            0,
+            1,
+            |_| panic!("unknown identity must not open"),
+            |_| panic!("unknown identity must not query"),
+            |_, _| panic!("unknown identity must not kill"),
+        )
+        .unwrap_err();
+        assert_eq!(err.reason, ShutdownReason::IdentityUnknown);
+    }
+
+    #[test]
+    fn verified_termination_classifies_access_and_query_failures() {
+        let denied = windows::core::Error::from_hresult(HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+        let err = terminate_with::<()>(
+            12,
+            100,
+            1,
+            |_| Err(denied.into()),
+            |_| unreachable!(),
+            |_, _| unreachable!(),
+        )
+        .unwrap_err();
+        assert_eq!(err.reason, ShutdownReason::AccessDenied);
+        let err = terminate_with(
+            12,
+            100,
+            1,
+            |_| Ok(Some(())),
+            |_| Err(anyhow!("identity read failed")),
+            |_, _| panic!("failed query must not kill"),
+        )
+        .unwrap_err();
+        assert_eq!(err.reason, ShutdownReason::QueryFailed);
+        assert!(err.detail.contains("identity read failed"));
+        let err = terminate_with::<()>(
+            12,
+            100,
+            1,
+            |_| Ok(None),
+            |_| unreachable!(),
+            |_, _| unreachable!(),
+        )
+        .unwrap_err();
+        assert_eq!(err.reason, ShutdownReason::IdentityChanged);
+    }
+
+    #[test]
+    fn verified_termination_propagates_terminate_failure() {
+        let called = std::cell::Cell::new(false);
+        let err = terminate_with(
+            12,
+            100,
+            7,
+            |_| Ok(Some((12, 100))),
+            |h| Ok(*h),
+            |_, code| {
+                called.set(true);
+                assert_eq!(code, 7);
+                Err(anyhow!("API denied termination"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.reason, ShutdownReason::TerminateFailed);
+        assert!(called.get());
+        assert!(err.detail.contains("API denied termination"));
+    }
+
+    #[test]
+    fn exit_observation_retains_signaled_handle_without_exit_code() {
+        assert_eq!(
+            classify_process_state(WAIT_OBJECT_0.0, None).unwrap(),
+            ProcessState::Exited(None)
+        );
+        assert_eq!(
+            classify_process_state(WAIT_OBJECT_0.0, Some(9)).unwrap(),
+            ProcessState::Exited(Some(9))
+        );
+        assert_eq!(
+            classify_process_state(WAIT_TIMEOUT.0, None).unwrap(),
+            ProcessState::Running
+        );
+        assert!(classify_process_state(u32::MAX, None).is_err());
+    }
 
     #[test]
     fn read_metrics_of_self() {

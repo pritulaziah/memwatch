@@ -16,7 +16,7 @@ use windows::Win32::System::Power::{
 use crate::collect::cdp::CdpCollector;
 use crate::collect::gpu::GpuCollector;
 use crate::collect::job::JobCollector;
-use crate::collect::process::{ProcessCollector, ProcessTree};
+use crate::collect::process::{ProcessCollector, ProcessTree, ShutdownFailure, ShutdownOutcome};
 use crate::collect::system::SystemCollector;
 use crate::collect::{CollectError, Collector, FailureCounter, TickCtx};
 use crate::launch::{Launched, launch};
@@ -36,6 +36,23 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 /// How long the DevTools polling thread is given to stop after the run.
 const CDP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Saves shutdown diagnostics before propagating any original collection error.
+pub(crate) fn save_shutdown(
+    meta: &mut Meta,
+    result: Result<ShutdownOutcome, ShutdownFailure>,
+) -> Result<(), CollectError> {
+    match result {
+        Ok(outcome) => {
+            meta.shutdown_issues = outcome.issues;
+            Ok(())
+        }
+        Err(failure) => {
+            meta.shutdown_issues = failure.outcome.issues;
+            Err(failure.error)
+        }
+    }
+}
 
 /// A handle that asks a run to stop.
 #[derive(Clone)]
@@ -270,7 +287,7 @@ pub fn run(opts: &RunOptions, stop: StopHandle) -> anyhow::Result<RunOutcome> {
 
     let t_ms = started.elapsed().as_millis() as u64;
     let unix_ms = unix_ms_now();
-    match sampler.tree.finish(t_ms, unix_ms, SHUTDOWN_WAIT) {
+    match save_shutdown(&mut meta, sampler.tree.finish(t_ms, unix_ms, SHUTDOWN_WAIT)) {
         Ok(()) => {}
         Err(CollectError::Source(err)) => {
             log.error("process", format!("cannot finish the process tree: {err}"));
@@ -539,4 +556,56 @@ fn unix_ms_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::{ShutdownIssue, ShutdownReason, ShutdownState};
+
+    #[test]
+    fn shutdown_diagnostics_preserve_run_outcome() {
+        let mut meta = crate::analyze::fixtures::sample_meta();
+        meta.end_reason = Some(EndReason::CtrlC);
+        meta.exit_code = Some(7);
+        let outcome = RunOutcome {
+            run_dir: PathBuf::from("owned-run"),
+            end_reason: EndReason::CtrlC,
+            exit_code: Some(7),
+        };
+        let issue = ShutdownIssue {
+            pid: 12,
+            proc_key: None,
+            role: "main".into(),
+            state: ShutdownState::Alive,
+            reason: ShutdownReason::WaitTimeout,
+        };
+        save_shutdown(
+            &mut meta,
+            Ok(ShutdownOutcome {
+                issues: vec![issue.clone()],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            meta.shutdown_issues.as_slice(),
+            std::slice::from_ref(&issue)
+        );
+        let result = save_shutdown(
+            &mut meta,
+            Err(ShutdownFailure {
+                outcome: ShutdownOutcome {
+                    issues: vec![issue.clone()],
+                },
+                error: CollectError::Write(io::Error::other("original write failure")),
+            }),
+        );
+        assert!(
+            matches!(result, Err(CollectError::Write(err)) if err.to_string() == "original write failure")
+        );
+        assert_eq!(meta.shutdown_issues, [issue]);
+        assert_eq!(meta.end_reason, Some(outcome.end_reason));
+        assert_eq!(meta.exit_code, outcome.exit_code);
+        assert_eq!(outcome.run_dir, PathBuf::from("owned-run"));
+    }
 }

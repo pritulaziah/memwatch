@@ -489,7 +489,11 @@ fn read_events(path: &Path) -> Vec<EventRow> {
 fn read_meta(run_dir: &Path) -> serde_json::Value {
     let content =
         fs::read_to_string(run_dir.join("meta.json")).expect("meta.json must be readable");
-    serde_json::from_str(&content).expect("meta.json must be valid JSON")
+    let meta: serde_json::Value =
+        serde_json::from_str(&content).expect("meta.json must be valid JSON");
+    assert_eq!(meta["schema_version"], 1);
+    assert_eq!(meta["shutdown_issues"], serde_json::json!([]));
+    meta
 }
 
 /// Waits until the process with `pid` is gone or `timeout` runs out.

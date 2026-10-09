@@ -124,6 +124,7 @@ pub const CDP_COLUMNS: &[&str] = &[
     "recalc_style_duration_ms",
     "script_duration_ms",
     "task_duration_ms",
+    "session_id",
 ];
 
 /// Creates the run directory `<out>/<name>-<YYYYMMDD-HHMMSS>`.
@@ -384,6 +385,8 @@ pub struct CdpRow {
     pub script_duration_ms: Option<u64>,
     /// Task execution time in milliseconds (cumulative).
     pub task_duration_ms: Option<u64>,
+    /// Positive measurement session ID; empty when the connection was not established.
+    pub session_id: Option<u64>,
 }
 
 /// An append-only CSV file with a fixed header row.
@@ -547,6 +550,7 @@ mod tests {
             recalc_style_duration_ms: None,
             script_duration_ms: Some(500),
             task_duration_ms: None,
+            session_id: Some(1),
         }
     }
 
@@ -583,6 +587,56 @@ mod tests {
             record.len(),
             columns.len(),
             "{file}: the row must have one field per column"
+        );
+    }
+
+    #[test]
+    fn cdp_header_appends_nullable_session_identity() {
+        let expected = [
+            "t_ms",
+            "unix_ms",
+            "target_id",
+            "url",
+            "js_heap_used_bytes",
+            "js_heap_total_bytes",
+            "nodes",
+            "documents",
+            "frames",
+            "js_event_listeners",
+            "layout_count",
+            "recalc_style_count",
+            "layout_duration_ms",
+            "recalc_style_duration_ms",
+            "script_duration_ms",
+            "task_duration_ms",
+            "session_id",
+        ];
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cdp.csv");
+        let mut table = CsvTable::create(&path, CDP_COLUMNS).unwrap();
+        let mut row = sample_cdp_row();
+        row.session_id = Some(1);
+        table.write(&row).unwrap();
+        row.session_id = None;
+        table.write(&row).unwrap();
+        table.flush(false).unwrap();
+
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_path(&path)
+            .unwrap();
+        let mut records = reader.records();
+        let header = records.next().unwrap().unwrap();
+        assert_eq!(header.iter().collect::<Vec<_>>(), expected);
+        let connected = records.next().unwrap().unwrap();
+        let unknown = records.next().unwrap().unwrap();
+        assert_eq!(connected.len(), expected.len());
+        assert_eq!(unknown.len(), expected.len());
+        assert_eq!(connected.get(16), Some("1"));
+        assert_eq!(unknown.get(16), Some(""));
+        assert_eq!(
+            connected.iter().take(16).collect::<Vec<_>>(),
+            unknown.iter().take(16).collect::<Vec<_>>()
         );
     }
 
@@ -643,6 +697,29 @@ mod tests {
         );
         check_row_matches_columns(dir.path(), "gpu.csv", GPU_COLUMNS, &sample_gpu_row());
         check_row_matches_columns(dir.path(), "cdp.csv", CDP_COLUMNS, &sample_cdp_row());
+        let (_, record) = round_trip(dir.path(), "cdp.csv", CDP_COLUMNS, &sample_cdp_row());
+        assert_eq!(
+            record.iter().collect::<Vec<_>>(),
+            [
+                "1000",
+                "1700000000000",
+                "A1B2C3D4",
+                "http://127.0.0.1:5173/",
+                "10000000",
+                "20000000",
+                "1500",
+                "3",
+                "2",
+                "450",
+                "12",
+                "30",
+                "125",
+                "",
+                "500",
+                "",
+                "1",
+            ]
+        );
     }
 
     #[test]

@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::analyze::{
-    CpuStats, MetricId, MetricStats, Run, RunReadError, Series, Summary, Warning, WarningMessage,
-    Window, compute_warnings, load, process_series, role_series, summarize,
+    CdpTargetSummary, CpuPercentStats, CpuStats, MetricId, MetricStats, Run, RunReadError, Series,
+    Summary, Warning, WarningMessage, Window, WindowSummary, compute_warnings, load,
+    process_series, role_series, summarize,
 };
+use crate::meta::{CollectorStatus, ShutdownReason, ShutdownState};
 use crate::store::ProcessEvent;
 
 /// One mebibyte in bytes; memory values are shown in these units.
@@ -32,8 +34,32 @@ pub enum Lang {
 pub struct ReportOptions {
     /// Language of the report.
     pub lang: Lang,
-    /// Warmup excluded from growth and hour deltas.
+    /// Warmup excluded from all after-warmup window statistics.
     pub warmup: Duration,
+}
+
+/// Formatted primary metrics and CPU percentages of one analysis window.
+#[derive(Debug)]
+pub struct WindowView {
+    /// Inclusive run-relative boundaries, or an explanation of an absent window.
+    pub caption: String,
+    /// Fixed-order primary metric rows for the window.
+    pub metric_rows: Vec<Vec<String>>,
+    /// Mean, median and 95th-percentile tree CPU percentage rows.
+    pub cpu_rows: Vec<Vec<String>>,
+    /// Explanation when the after-warmup window has no usable data.
+    pub no_data: Option<String>,
+}
+
+/// Formatted independent gauge statistics of one recorded CDP target.
+#[derive(Debug)]
+pub struct CdpTargetView {
+    /// Recorded source identity, not its URL.
+    pub target_id: String,
+    /// Whole-run gauge rows with usable sample counts as their final cell.
+    pub whole_run_rows: Vec<Vec<String>>,
+    /// After-warmup gauge rows with usable sample counts as their final cell.
+    pub steady_state_rows: Vec<Vec<String>>,
 }
 
 /// The report model of a run: header, warnings and table rows.
@@ -47,13 +73,17 @@ pub struct ReportView {
     pub header: Vec<(String, String)>,
     /// Warnings rendered in the report language.
     pub warnings: Vec<String>,
-    /// Rows of the summary table.
-    pub summary_rows: Vec<Vec<String>>,
-    /// Rows of the CPU table.
-    pub cpu_rows: Vec<Vec<String>>,
-    /// Rows of the role table.
+    /// Whole-run primary metric and CPU percentage tables.
+    pub whole_run: WindowView,
+    /// After-warmup primary metric and CPU percentage tables.
+    pub steady_state: WindowView,
+    /// Cumulative CPU seconds and process lifecycle counters, shown once.
+    pub totals_rows: Vec<Vec<String>>,
+    /// Independent CDP source tables in alphabetical target order.
+    pub cdp_targets: Vec<CdpTargetView>,
+    /// Rows of the role table, with peaks over the entire run.
     pub role_rows: Vec<Vec<String>>,
-    /// Rows of the process table.
+    /// Rows of the process table, with peaks over the entire run.
     pub process_rows: Vec<Vec<String>>,
     /// Warmup of the summary in milliseconds.
     pub warmup_ms: u64,
@@ -67,6 +97,30 @@ struct Texts {
     heading_warnings: &'static str,
     /// Heading of the tree summary section.
     heading_summary: &'static str,
+    /// Heading of each whole-run window table.
+    heading_whole_run: &'static str,
+    /// Heading of each after-warmup window table.
+    heading_steady_state: &'static str,
+    /// Heading of the independent CDP source section.
+    heading_cdp_targets: &'static str,
+    /// Heading of the cumulative totals table.
+    heading_totals: &'static str,
+    /// Template for inclusive run-relative window boundaries.
+    window_caption: &'static str,
+    /// Caption for an absent after-warmup window.
+    empty_window: &'static str,
+    /// Explanation for an after-warmup window without usable data.
+    empty_steady_data: &'static str,
+    /// Explanation of the CPU percentage scale.
+    cpu_scope: &'static str,
+    /// Explanation of the scope of role and process peaks.
+    whole_run_scope: &'static str,
+    /// Explanation of CDP measurement attribution and the absence of totals.
+    cdp_scope: &'static str,
+    /// Template naming a recorded CDP measurement source.
+    target_label: &'static str,
+    /// Final column label for usable target gauge sample counts.
+    samples_header: &'static str,
     /// Heading of the roles section.
     heading_roles: &'static str,
     /// Heading of the processes section.
@@ -87,7 +141,9 @@ struct Texts {
     dash: &'static str,
     /// Labels of the header fields, in report order.
     header_fields: [&'static str; 11],
-    /// Headers of the summary table.
+    /// Headers of the whole-run summary table, without trends.
+    whole_run_headers: [&'static str; 8],
+    /// Headers of the after-warmup summary table, including trends.
     summary_headers: [&'static str; 11],
     /// Headers of the CPU table.
     cpu_headers: [&'static str; 2],
@@ -121,6 +177,24 @@ struct Texts {
     warning_noisy_machine: &'static str,
     /// Template of a collector-status warning.
     warning_collector_status: &'static str,
+    /// Safe localized CDP failure status; raw protocol details remain in the log.
+    cdp_failed: &'static str,
+    /// Template for missing usable CDP gauge samples.
+    warning_cdp_metrics_missing: &'static str,
+    /// Warning about a source unavailable at the end of a completed run.
+    warning_cdp_waiting: &'static str,
+    /// Template for excluded CDP rows without source identity.
+    warning_cdp_identity: &'static str,
+    /// Template for a recorded process with unconfirmed shutdown.
+    warning_shutdown: &'static str,
+    /// Names both requested CDP gauges.
+    cdp_both_metrics: &'static str,
+    /// Global scope of missing CDP gauge warnings.
+    whole_run_warning_scope: &'static str,
+    /// Localized states in Alive, Unknown order.
+    shutdown_states: [&'static str; 2],
+    /// Localized reasons in the order of ShutdownReason variants.
+    shutdown_reasons: [&'static str; 6],
     /// Text of a tree-walk fallback warning.
     warning_tree_walk_fallback: &'static str,
     /// Template of an unexpected-end-reason warning.
@@ -144,6 +218,18 @@ const EN: Texts = Texts {
     title: "Run {name}",
     heading_warnings: "Warnings",
     heading_summary: "Tree summary",
+    heading_whole_run: "Whole run",
+    heading_steady_state: "After warmup",
+    heading_cdp_targets: "CDP targets",
+    heading_totals: "Run totals",
+    window_caption: "Window: [{start}, {end}], inclusive",
+    empty_window: "No window after warmup",
+    empty_steady_data: "No usable data after warmup",
+    cpu_scope: "CPU %: 100% is the whole machine",
+    whole_run_scope: "Roles and process peaks cover the whole run",
+    cdp_scope: "CDP targets are measurement sources; renderer/isolate scope may be shared. Values are not summed.",
+    target_label: "CDP target {id}",
+    samples_header: "Samples",
     heading_roles: "Roles",
     heading_processes: "Processes",
     no_warnings: "No warnings",
@@ -166,6 +252,7 @@ const EN: Texts = Texts {
         "Warmup",
         "Collectors",
     ],
+    whole_run_headers: ["Metric", "Start", "Peak", "Mean", "p50", "p95", "End", "Δ"],
     summary_headers: [
         "Metric",
         "Start",
@@ -217,6 +304,22 @@ const EN: Texts = Texts {
     warning_time_gap: "data gap: {seconds} s",
     warning_noisy_machine: "noisy machine: on average {average} % of outside load",
     warning_collector_status: "collector {name}: {status}",
+    cdp_failed: "failed (details in memwatch.log)",
+    warning_cdp_metrics_missing: "CDP requested, but no usable {metrics} samples for {scope}",
+    warning_cdp_waiting: "CDP source was unavailable at the end of the run",
+    warning_cdp_identity: "CDP: {rows} rows without target identity were excluded",
+    warning_shutdown: "Incomplete shutdown: PID {pid}, identity {key}, role {role}, state {state}, reason {reason}",
+    cdp_both_metrics: "JS heap and DOM nodes",
+    whole_run_warning_scope: "the whole run",
+    shutdown_states: ["alive", "unknown"],
+    shutdown_reasons: [
+        "access denied",
+        "identity unknown",
+        "identity changed",
+        "state query failed",
+        "termination failed",
+        "wait timed out",
+    ],
     warning_tree_walk_fallback: "processes left the job: tree walk enabled",
     warning_unexpected_end_reason: "unexpected end reason: {reason}",
     error_missing_meta: "no meta.json in the run directory {dir}",
@@ -232,6 +335,18 @@ const RU: Texts = Texts {
     title: "Прогон {name}",
     heading_warnings: "Предупреждения",
     heading_summary: "Итоги по дереву",
+    heading_whole_run: "Весь прогон",
+    heading_steady_state: "После прогрева",
+    heading_cdp_targets: "Источники CDP",
+    heading_totals: "Общие итоги прогона",
+    window_caption: "Окно: [{start}, {end}], границы включены",
+    empty_window: "Нет окна после прогрева",
+    empty_steady_data: "Нет пригодных данных после прогрева",
+    cpu_scope: "CPU %: 100% соответствует всей машине",
+    whole_run_scope: "Роли и пики процессов относятся ко всему прогону",
+    cdp_scope: "CDP targets — источники измерений; область renderer/isolate может быть общей. Значения не суммируются.",
+    target_label: "источник CDP {id}",
+    samples_header: "Замеров",
     heading_roles: "Роли",
     heading_processes: "Процессы",
     no_warnings: "Предупреждений нет",
@@ -253,6 +368,16 @@ const RU: Texts = Texts {
         "Версии exe",
         "Прогрев",
         "Сборщики",
+    ],
+    whole_run_headers: [
+        "Метрика",
+        "Старт",
+        "Пик",
+        "Среднее",
+        "p50",
+        "p95",
+        "Конец",
+        "Δ",
     ],
     summary_headers: [
         "Метрика",
@@ -300,6 +425,22 @@ const RU: Texts = Texts {
     warning_time_gap: "разрыв в данных: {seconds} с",
     warning_noisy_machine: "шумная машина: в среднем {average} % посторонней нагрузки",
     warning_collector_status: "сборщик {name}: {status}",
+    cdp_failed: "сбой (подробности в memwatch.log)",
+    warning_cdp_metrics_missing: "CDP запрошен, но нет пригодных замеров {metrics}: {scope}",
+    warning_cdp_waiting: "Источник CDP был недоступен к концу прогона",
+    warning_cdp_identity: "CDP: исключено строк без идентичности target: {rows}",
+    warning_shutdown: "Неполная остановка: PID {pid}, идентичность {key}, роль {role}, состояние {state}, причина {reason}",
+    cdp_both_metrics: "JS heap и DOM nodes",
+    whole_run_warning_scope: "весь прогон",
+    shutdown_states: ["жив", "неизвестно"],
+    shutdown_reasons: [
+        "отказ в доступе",
+        "идентичность неизвестна",
+        "идентичность изменилась",
+        "не удалось запросить состояние",
+        "не удалось завершить процесс",
+        "истекло время ожидания",
+    ],
     warning_tree_walk_fallback: "процессы вышли из job: включён обход дерева",
     warning_unexpected_end_reason: "неожиданная причина завершения: {reason}",
     error_missing_meta: "нет файла meta.json в папке прогона {dir}",
@@ -361,8 +502,24 @@ pub fn build(run: &Run, summary: &Summary, lang: Lang) -> ReportView {
             .iter()
             .map(|warning| warning_text(warning, lang))
             .collect(),
-        summary_rows: summary_rows(summary, texts),
-        cpu_rows: cpu_rows(summary, texts),
+        whole_run: window_view(
+            &summary.whole_run,
+            summary.primary_cdp_target.as_deref(),
+            false,
+            texts,
+        ),
+        steady_state: window_view(
+            &summary.steady_state,
+            summary.primary_cdp_target.as_deref(),
+            true,
+            texts,
+        ),
+        totals_rows: totals_rows(summary, texts),
+        cdp_targets: summary
+            .cdp_targets
+            .iter()
+            .map(|target| target_view(target, summary, texts))
+            .collect(),
         role_rows: role_rows(run, texts),
         process_rows: process_rows(run, texts),
         warmup_ms: summary.warmup_ms,
@@ -406,11 +563,81 @@ pub fn render(view: &ReportView) -> String {
     lines.push(String::new());
     lines.push(format!("## {}", texts.heading_summary));
     lines.push(String::new());
-    lines.extend(table(&texts.summary_headers, &view.summary_rows));
+    lines.push(texts.cpu_scope.to_string());
     lines.push(String::new());
-    lines.extend(table(&texts.cpu_headers, &view.cpu_rows));
+    for (heading, window, headers) in [
+        (
+            texts.heading_whole_run,
+            &view.whole_run,
+            texts.whole_run_headers.as_slice(),
+        ),
+        (
+            texts.heading_steady_state,
+            &view.steady_state,
+            texts.summary_headers.as_slice(),
+        ),
+    ] {
+        lines.push(format!("### {heading}"));
+        lines.push(String::new());
+        lines.push(window.caption.clone());
+        lines.push(String::new());
+        if let Some(no_data) = &window.no_data {
+            lines.push(no_data.clone());
+            lines.push(String::new());
+        }
+        lines.extend(table(headers, &window.metric_rows));
+        lines.push(String::new());
+        lines.extend(table(&texts.cpu_headers, &window.cpu_rows));
+        lines.push(String::new());
+    }
+    lines.push(format!("### {}", texts.heading_totals));
     lines.push(String::new());
+    lines.extend(table(&texts.cpu_headers, &view.totals_rows));
+    lines.push(String::new());
+    lines.push(format!("## {}", texts.heading_cdp_targets));
+    lines.push(String::new());
+    lines.push(texts.cdp_scope.to_string());
+    lines.push(String::new());
+    if view.cdp_targets.is_empty() {
+        lines.push(texts.no_data.to_string());
+        lines.push(String::new());
+    }
+    for target in &view.cdp_targets {
+        lines.push(format!(
+            "### {}",
+            fill(
+                texts.target_label,
+                &[("id", &markdown_literal(&target.target_id))]
+            )
+        ));
+        lines.push(String::new());
+        for (heading, window, rows, headers) in [
+            (
+                texts.heading_whole_run,
+                &view.whole_run,
+                &target.whole_run_rows,
+                texts.whole_run_headers.as_slice(),
+            ),
+            (
+                texts.heading_steady_state,
+                &view.steady_state,
+                &target.steady_state_rows,
+                texts.summary_headers.as_slice(),
+            ),
+        ] {
+            lines.push(format!("#### {heading}"));
+            lines.push(String::new());
+            lines.push(window.caption.clone());
+            lines.push(String::new());
+            let mut headers = headers.to_vec();
+            headers.push(texts.samples_header);
+            lines.extend(table(&headers, rows));
+            lines.push(String::new());
+        }
+    }
     lines.push(format!("## {}", texts.heading_roles));
+    lines.push(String::new());
+    lines.push(texts.whole_run_scope.to_string());
     lines.push(String::new());
     lines.extend(table(&texts.role_headers, &view.role_rows));
     lines.push(String::new());
@@ -469,12 +696,44 @@ fn warning_text(warning: &Warning, lang: Lang) -> String {
             fill(texts.warning_noisy_machine, &[("average", &average)])
         }
         WarningMessage::CollectorStatus { name, status } => {
-            let status = status.to_string();
+            let status = collector_status_text(name, status, texts);
             fill(
                 texts.warning_collector_status,
                 &[("name", name), ("status", &status)],
             )
         }
+        WarningMessage::CdpMetricsMissing { target_id, metric } => {
+            let metrics = match metric {
+                Some(MetricId::JsHeapUsedBytes) => "JS heap",
+                Some(MetricId::DomNodes) => "DOM nodes",
+                _ => texts.cdp_both_metrics,
+            };
+            let scope = target_id.as_ref().map_or_else(
+                || texts.whole_run_warning_scope.to_string(),
+                |id| fill(texts.target_label, &[("id", &markdown_literal(id))]),
+            );
+            fill(
+                texts.warning_cdp_metrics_missing,
+                &[("metrics", metrics), ("scope", &scope)],
+            )
+        }
+        WarningMessage::CdpWaiting => texts.warning_cdp_waiting.to_string(),
+        WarningMessage::CdpTargetIdentityMissing { rows } => {
+            fill(texts.warning_cdp_identity, &[("rows", &rows.to_string())])
+        }
+        WarningMessage::ShutdownIssue { issue } => fill(
+            texts.warning_shutdown,
+            &[
+                ("pid", &issue.pid.to_string()),
+                (
+                    "key",
+                    &markdown_literal(issue.proc_key.as_deref().unwrap_or(texts.dash)),
+                ),
+                ("role", &markdown_literal(&issue.role)),
+                ("state", shutdown_state_text(issue.state, texts)),
+                ("reason", shutdown_reason_text(issue.reason, texts)),
+            ],
+        ),
         WarningMessage::TreeWalkFallback => texts.warning_tree_walk_fallback.to_string(),
         WarningMessage::DidNotFinish => texts.did_not_finish.to_string(),
         WarningMessage::UnexpectedEndReason { reason } => {
@@ -482,6 +741,35 @@ fn warning_text(warning: &Warning, lang: Lang) -> String {
             fill(texts.warning_unexpected_end_reason, &[("reason", &reason)])
         }
     }
+}
+
+/// Formats CDP failures without publishing arbitrary saved protocol details.
+fn collector_status_text(name: &str, status: &CollectorStatus, texts: &Texts) -> String {
+    if name == "cdp" && matches!(status, CollectorStatus::Failed(_)) {
+        texts.cdp_failed.to_string()
+    } else {
+        status.to_string()
+    }
+}
+
+/// Localizes a coded final process state without arbitrary diagnostic text.
+fn shutdown_state_text(state: ShutdownState, texts: &Texts) -> &str {
+    texts.shutdown_states[match state {
+        ShutdownState::Alive => 0,
+        ShutdownState::Unknown => 1,
+    }]
+}
+
+/// Localizes a coded shutdown reason without arbitrary diagnostic text.
+fn shutdown_reason_text(reason: ShutdownReason, texts: &Texts) -> &str {
+    texts.shutdown_reasons[match reason {
+        ShutdownReason::AccessDenied => 0,
+        ShutdownReason::IdentityUnknown => 1,
+        ShutdownReason::IdentityChanged => 2,
+        ShutdownReason::QueryFailed => 3,
+        ShutdownReason::TerminateFailed => 4,
+        ShutdownReason::WaitTimeout => 5,
+    }]
 }
 
 /// Renders one run read error in the given language.
@@ -511,6 +799,28 @@ fn fill(template: &str, values: &[(&str, &str)]) -> String {
         text = text.replace(&format!("{{{key}}}"), value);
     }
     text
+}
+
+/// Escapes an inline literal for Markdown headings and GFM table cells.
+///
+/// Line endings are spelled visibly to keep labels on one physical line. Escaped
+/// backticks prevent code spans from bypassing escapes, and pipes remain escaped
+/// even when the original identity placed them between backticks.
+fn markdown_literal(value: &str) -> String {
+    let mut literal = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\r' => literal.push_str("\\\\r"),
+            '\n' => literal.push_str("\\\\n"),
+            '\\' | '`' | '*' | '_' | '~' | '[' | ']' | '(' | ')' | '<' | '>' | '#' | '&' | '!'
+            | '|' => {
+                literal.push('\\');
+                literal.push(ch);
+            }
+            _ => literal.push(ch),
+        }
+    }
+    literal
 }
 
 /// Builds the label/value header fields in report order.
@@ -606,7 +916,7 @@ fn collectors_value(run: &Run, texts: &Texts) -> String {
     run.meta
         .collectors
         .iter()
-        .map(|(name, status)| format!("{name}: {status}"))
+        .map(|(name, status)| format!("{name}: {}", collector_status_text(name, status, texts)))
         .collect::<Vec<String>>()
         .join(", ")
 }
@@ -646,30 +956,133 @@ fn images_value(run: &Run, texts: &Texts) -> String {
         .join("; ")
 }
 
-/// Builds the metric table rows in the fixed metric order.
-fn summary_rows(summary: &Summary, texts: &Texts) -> Vec<Vec<String>> {
+/// Builds available primary metric rows in the fixed order, naming any CDP source.
+fn summary_rows(
+    window: &WindowSummary,
+    primary_target: Option<&str>,
+    steady: bool,
+    texts: &Texts,
+) -> Vec<Vec<String>> {
     METRIC_ROWS
         .iter()
-        .map(|(metric, label, kind)| {
-            let stats = &summary.metrics[metric];
-            vec![
-                (*label).to_string(),
-                metric_value(stats.start, *kind, texts),
-                metric_value(stats.peak, *kind, texts),
-                metric_value(stats.mean, *kind, texts),
-                metric_value(stats.p50, *kind, texts),
-                metric_value(stats.p95, *kind, texts),
-                metric_value(stats.end, *kind, texts),
-                metric_value(stats.delta, *kind, texts),
-                stats.growth_per_hour.map_or_else(
-                    || texts.no_data.to_string(),
-                    |value| fmt_growth(value, *kind, texts),
-                ),
-                fit_value(stats.r2, texts),
-                median_value(stats, *kind, summary.too_short_for_hour_delta, texts),
-            ]
+        .filter_map(|(metric, label, kind)| {
+            let stats = window.metrics.get(metric)?;
+            let scoped_label = if matches!(metric, MetricId::JsHeapUsedBytes | MetricId::DomNodes) {
+                primary_target.map(|id| {
+                    format!(
+                        "{label} ({})",
+                        fill(texts.target_label, &[("id", &markdown_literal(id))])
+                    )
+                })
+            } else {
+                None
+            };
+            Some(metric_row(
+                scoped_label.as_deref().unwrap_or(label),
+                stats,
+                *kind,
+                steady,
+                window.too_short_for_hour_delta,
+                texts,
+            ))
         })
         .collect()
+}
+
+/// Formats one metric row with trends only in the after-warmup table.
+fn metric_row(
+    label: &str,
+    stats: &MetricStats,
+    kind: MetricKind,
+    steady: bool,
+    too_short: bool,
+    texts: &Texts,
+) -> Vec<String> {
+    let mut row = vec![
+        label.to_string(),
+        metric_value(stats.start, kind, texts),
+        metric_value(stats.peak, kind, texts),
+        metric_value(stats.mean, kind, texts),
+        metric_value(stats.p50, kind, texts),
+        metric_value(stats.p95, kind, texts),
+        metric_value(stats.end, kind, texts),
+        metric_value(stats.delta, kind, texts),
+    ];
+    if steady {
+        row.extend([
+            stats.growth_per_hour.map_or_else(
+                || texts.no_data.to_string(),
+                |value| fmt_growth(value, kind, texts),
+            ),
+            fit_value(stats.r2, texts),
+            median_value(stats, kind, too_short, texts),
+        ]);
+    }
+    row
+}
+
+/// Formats primary rows, CPU rows and the availability explanation for a window.
+fn window_view(
+    window: &WindowSummary,
+    primary_target: Option<&str>,
+    steady: bool,
+    texts: &Texts,
+) -> WindowView {
+    WindowView {
+        caption: window_caption(window.window, texts),
+        metric_rows: summary_rows(window, primary_target, steady, texts),
+        cpu_rows: cpu_rows(&window.cpu, texts),
+        no_data: (steady && !window.has_data).then(|| texts.empty_steady_data.to_string()),
+    }
+}
+
+/// Formats both windows of a target, appending each gauge's usable sample count.
+fn target_view(target: &CdpTargetSummary, summary: &Summary, texts: &Texts) -> CdpTargetView {
+    let rows = |metrics: &BTreeMap<MetricId, MetricStats>, steady| {
+        METRIC_ROWS
+            .iter()
+            .filter_map(|(metric, label, kind)| {
+                let stats = metrics.get(metric)?;
+                let mut row = metric_row(
+                    label,
+                    stats,
+                    *kind,
+                    steady,
+                    summary.steady_state.too_short_for_hour_delta,
+                    texts,
+                );
+                row.push(stats.samples.to_string());
+                Some(row)
+            })
+            .collect()
+    };
+    CdpTargetView {
+        target_id: target.target_id.clone(),
+        whole_run_rows: rows(&target.whole_run, false),
+        steady_state_rows: rows(&target.steady_state, true),
+    }
+}
+
+/// Formats inclusive run-relative boundaries without displaying a reversed interval.
+fn window_caption(window: Option<Window>, texts: &Texts) -> String {
+    let instant = |ms| {
+        let value = format_duration_ms(ms);
+        if ms % 1000 == 0 {
+            value
+        } else {
+            format!("{value}.{:03}", ms % 1000)
+        }
+    };
+    match window {
+        Some(window) => fill(
+            texts.window_caption,
+            &[
+                ("start", &instant(window.start_ms)),
+                ("end", &instant(window.end_ms)),
+            ],
+        ),
+        None => texts.empty_window.to_string(),
+    }
 }
 
 /// Formats one metric cell of its kind, or the no-data placeholder.
@@ -700,12 +1113,9 @@ fn median_value(stats: &MetricStats, kind: MetricKind, too_short: bool, texts: &
     }
 }
 
-/// Builds the CPU and process counter table rows.
-fn cpu_rows(summary: &Summary, texts: &Texts) -> Vec<Vec<String>> {
-    let cpu = &summary.cpu;
-    let processes = &summary.processes;
+/// Builds the three tree CPU percentage rows of a window.
+fn cpu_rows(cpu: &CpuPercentStats, texts: &Texts) -> Vec<Vec<String>> {
     vec![
-        vec![texts.cpu_rows[0].to_string(), cpu_seconds_value(cpu, texts)],
         vec![
             texts.cpu_rows[1].to_string(),
             percent_value(cpu.mean_pct, texts),
@@ -717,6 +1127,17 @@ fn cpu_rows(summary: &Summary, texts: &Texts) -> Vec<Vec<String>> {
         vec![
             texts.cpu_rows[3].to_string(),
             percent_value(cpu.p95_pct, texts),
+        ],
+    ]
+}
+
+/// Builds cumulative CPU seconds and lifecycle totals once for the entire run.
+fn totals_rows(summary: &Summary, texts: &Texts) -> Vec<Vec<String>> {
+    let processes = &summary.processes;
+    vec![
+        vec![
+            texts.cpu_rows[0].to_string(),
+            cpu_seconds_value(&summary.cpu, texts),
         ],
         vec![texts.cpu_rows[4].to_string(), processes.started.to_string()],
         vec![texts.cpu_rows[5].to_string(), processes.exited.to_string()],
@@ -806,7 +1227,6 @@ fn process_rows(run: &Run, texts: &Texts) -> Vec<Vec<String>> {
     let private = process_series(run, |sample| sample.private_bytes);
     let working = process_series(run, |sample| sample.working_set);
     let exits = exit_ticks(run);
-    let last_ticks = last_ticks(run);
     let mut seen = HashSet::new();
     let mut rows = Vec::new();
     for event in &run.events {
@@ -820,10 +1240,7 @@ fn process_rows(run: &Run, texts: &Texts) -> Vec<Vec<String>> {
             continue;
         }
         let start_ms = Some(event.t_ms);
-        let end_ms = exits
-            .get(key)
-            .copied()
-            .or_else(|| last_ticks.get(key).copied());
+        let end_ms = exits.get(key).copied();
         rows.push(vec![
             event
                 .role
@@ -860,21 +1277,6 @@ fn exit_ticks(run: &Run) -> BTreeMap<String, u64> {
             .or_insert(event.t_ms);
     }
     exits
-}
-
-/// Maps every `proc_key` to its latest `process.csv` tick.
-fn last_ticks(run: &Run) -> BTreeMap<String, u64> {
-    let mut ticks: BTreeMap<String, u64> = BTreeMap::new();
-    for sample in &run.processes {
-        let Some(key) = &sample.proc_key else {
-            continue;
-        };
-        ticks
-            .entry(key.clone())
-            .and_modify(|tick| *tick = (*tick).max(sample.t_ms))
-            .or_insert(sample.t_ms);
-    }
-    ticks
 }
 
 /// Formats an instant as a duration from the run start, or a dash.
@@ -981,9 +1383,10 @@ mod tests {
         &view.header[4].1
     }
 
-    /// Maps the summary rows by their metric label.
+    /// Maps the after-warmup rows by their metric label.
     fn rows_by_label(view: &ReportView) -> BTreeMap<&str, &Vec<String>> {
-        view.summary_rows
+        view.steady_state
+            .metric_rows
             .iter()
             .map(|row| (row[0].as_str(), row))
             .collect()
@@ -1064,6 +1467,743 @@ mod tests {
     }
 
     #[test]
+    fn cdp_and_shutdown_warnings_are_bilingual() {
+        use crate::meta::{ShutdownIssue, ShutdownReason, ShutdownState};
+        for lang in [Lang::En, Lang::Ru] {
+            let mut run = fixtures::empty_run();
+            let expected = match lang {
+                Lang::En => {
+                    "CDP requested, but no usable JS heap and DOM nodes samples for the whole run"
+                }
+                Lang::Ru => {
+                    "CDP запрошен, но нет пригодных замеров JS heap и DOM nodes: весь прогон"
+                }
+            };
+            assert_eq!(build(&run, &summary_of(&run), lang).warnings, [expected]);
+            run.meta
+                .collectors
+                .insert("cdp".into(), CollectorStatus::Waiting);
+            run.cdp = vec![target_sample(0, "A", Some(0.0), Some(0.0))];
+            let waiting = match lang {
+                Lang::En => "CDP source was unavailable at the end of the run",
+                Lang::Ru => "Источник CDP был недоступен к концу прогона",
+            };
+            assert_eq!(build(&run, &summary_of(&run), lang).warnings, [waiting]);
+            run.meta
+                .collectors
+                .insert("cdp".into(), CollectorStatus::Ok);
+            run.cdp.push(target_sample(1, "", Some(1.0), Some(1.0)));
+            let identity = match lang {
+                Lang::En => "CDP: 1 rows without target identity were excluded",
+                Lang::Ru => "CDP: исключено строк без идентичности target: 1",
+            };
+            assert_eq!(build(&run, &summary_of(&run), lang).warnings, [identity]);
+            run.cdp.pop();
+            for (heap, nodes, en, ru) in [
+                (None, Some(1.0), "JS heap", "JS heap"),
+                (Some(1.0), None, "DOM nodes", "DOM nodes"),
+                (None, None, "JS heap and DOM nodes", "JS heap и DOM nodes"),
+            ] {
+                run.cdp = vec![
+                    target_sample(0, "A", Some(0.0), Some(0.0)),
+                    target_sample(1, "B", heap, nodes),
+                ];
+                let expected = match lang {
+                    Lang::En => {
+                        format!("CDP requested, but no usable {en} samples for CDP target B")
+                    }
+                    Lang::Ru => {
+                        format!("CDP запрошен, но нет пригодных замеров {ru}: источник CDP B")
+                    }
+                };
+                assert_eq!(build(&run, &summary_of(&run), lang).warnings, [expected]);
+                run.cdp.remove(0);
+                let expected = match lang {
+                    Lang::En => {
+                        format!("CDP requested, but no usable {en} samples for the whole run")
+                    }
+                    Lang::Ru => format!("CDP запрошен, но нет пригодных замеров {ru}: весь прогон"),
+                };
+                assert_eq!(build(&run, &summary_of(&run), lang).warnings, [expected]);
+            }
+            run.cdp = vec![target_sample(0, "A", Some(0.0), Some(0.0))];
+            for (reason, en, ru) in [
+                (
+                    ShutdownReason::AccessDenied,
+                    "access denied",
+                    "отказ в доступе",
+                ),
+                (
+                    ShutdownReason::IdentityUnknown,
+                    "identity unknown",
+                    "идентичность неизвестна",
+                ),
+                (
+                    ShutdownReason::IdentityChanged,
+                    "identity changed",
+                    "идентичность изменилась",
+                ),
+                (
+                    ShutdownReason::QueryFailed,
+                    "state query failed",
+                    "не удалось запросить состояние",
+                ),
+                (
+                    ShutdownReason::TerminateFailed,
+                    "termination failed",
+                    "не удалось завершить процесс",
+                ),
+                (
+                    ShutdownReason::WaitTimeout,
+                    "wait timed out",
+                    "истекло время ожидания",
+                ),
+            ] {
+                for (state, en_state, ru_state) in [
+                    (ShutdownState::Alive, "alive", "жив"),
+                    (ShutdownState::Unknown, "unknown", "неизвестно"),
+                ] {
+                    for key in [Some("10-100".to_string()), None] {
+                        run.meta.shutdown_issues = vec![ShutdownIssue {
+                            pid: 10,
+                            proc_key: key.clone(),
+                            role: "renderer".into(),
+                            state,
+                            reason,
+                        }];
+                        let key = key.as_deref().unwrap_or("—");
+                        let expected = match lang {
+                            Lang::En => format!(
+                                "Incomplete shutdown: PID 10, identity {key}, role renderer, state {en_state}, reason {en}"
+                            ),
+                            Lang::Ru => format!(
+                                "Неполная остановка: PID 10, идентичность {key}, роль renderer, состояние {ru_state}, причина {ru}"
+                            ),
+                        };
+                        let view = build(&run, &summary_of(&run), lang);
+                        assert_eq!(view.warnings, std::slice::from_ref(&expected));
+                        assert!(render(&view).contains(&format!("- {expected}")));
+                    }
+                }
+            }
+            run.meta.shutdown_issues.clear();
+            let raw = "B|`*_\r\n# [label]";
+            run.cdp.push(target_sample(1, raw, None, None));
+            let view = build(&run, &summary_of(&run), lang);
+            assert_eq!(view.cdp_targets[1].target_id, raw);
+            assert!(view.warnings[0].contains(&markdown_literal(raw)));
+            assert!(!view.warnings[0].contains('\n'));
+        }
+    }
+
+    #[test]
+    fn process_without_confirmed_exit_has_no_end_in_report() {
+        use crate::meta::{ShutdownIssue, ShutdownReason, ShutdownState};
+        let mut run = role_process_run();
+        run.processes
+            .push(memory_row(60_000, "200-2000", "renderer", MIB, MIB));
+        run.meta.shutdown_issues = vec![ShutdownIssue {
+            pid: 200,
+            proc_key: Some("200-2000".into()),
+            role: "renderer".into(),
+            state: ShutdownState::Alive,
+            reason: ShutdownReason::WaitTimeout,
+        }];
+        for lang in [Lang::En, Lang::Ru] {
+            let view = build(&run, &summary_of(&run), lang);
+            assert_eq!(&view.process_rows[1][4..6], ["—", "—"]);
+            assert_eq!(&view.process_rows[0][4..6], ["1:00", "1:00"]);
+            let state = match lang {
+                Lang::En => "state alive, reason wait timed out",
+                Lang::Ru => "состояние жив, причина истекло время ожидания",
+            };
+            assert!(view.warnings.iter().any(|warning| warning.contains(state)));
+            assert!(render(&view).contains("renderer.exe | — | 0:00 | — | — |"));
+        }
+    }
+
+    #[test]
+    fn requested_empty_cdp_never_renders_no_warnings() {
+        for lang in [Lang::En, Lang::Ru] {
+            for status in [CollectorStatus::Waiting, CollectorStatus::Ok] {
+                let mut run = fixtures::empty_run();
+                run.meta.collectors.insert("cdp".into(), status.clone());
+                let document = document_of(&run, lang);
+                assert!(!document.contains(texts(lang).no_warnings));
+                assert!(document.contains(match lang {
+                    Lang::En => "CDP requested",
+                    Lang::Ru => "CDP запрошен",
+                }));
+            }
+            let mut run = fixtures::empty_run();
+            run.meta
+                .collectors
+                .insert("cdp".into(), CollectorStatus::Waiting);
+            run.cdp = vec![target_sample(0, "A", Some(0.0), Some(0.0))];
+            assert!(!document_of(&run, lang).contains(texts(lang).no_warnings));
+        }
+    }
+
+    #[test]
+    fn failed_cdp_status_hides_legacy_details_in_header_and_warnings() {
+        let dir = TempDir::new().unwrap();
+        let run_dir = fixtures::write_run(dir.path());
+        let markers = [
+            "https://private.invalid/url-secret",
+            r"C:\private\path-secret\app.exe",
+            "--token=command-secret",
+            "arbitrary-unrecognized-suffix",
+        ];
+        let mut meta = fixtures::sample_meta();
+        meta.collectors
+            .insert("cdp".into(), CollectorStatus::Failed(markers.join(" ")));
+        // Other collectors retain their existing diagnostic detail.
+        meta.collectors.insert(
+            "gpu".into(),
+            CollectorStatus::Failed("gpu diagnostic".into()),
+        );
+        let mut legacy = serde_json::to_value(meta).unwrap();
+        legacy.as_object_mut().unwrap().remove("shutdown_issues");
+        fs::write(
+            run_dir.join("meta.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let run = load(&run_dir).unwrap();
+        assert!(run.meta.shutdown_issues.is_empty());
+        for lang in [Lang::En, Lang::Ru] {
+            let view = build(&run, &summary_of(&run), lang);
+            let copy = match lang {
+                Lang::En => "failed (details in memwatch.log)",
+                Lang::Ru => "сбой (подробности в memwatch.log)",
+            };
+            let header = &view.header[10].1;
+            let warnings = view.warnings.join("\n");
+            assert!(header.contains("gpu: failed: gpu diagnostic"));
+            for surface in [header.as_str(), warnings.as_str(), render(&view).as_str()] {
+                for marker in markers {
+                    assert!(!surface.contains(marker), "private marker leaked: {marker}");
+                }
+                assert!(surface.contains(copy));
+            }
+        }
+    }
+
+    #[test]
+    fn render_separates_startup_peak_from_steady_statistics() {
+        let mut run = fixtures::empty_run();
+        run.processes = vec![
+            memory_row(0, "100-1000", "main", 1000.0 * MIB, 1000.0 * MIB),
+            memory_row(599_999, "100-1000", "main", 1000.0 * MIB, 1000.0 * MIB),
+            memory_row(600_000, "100-1000", "main", 100.0 * MIB, 100.0 * MIB),
+            memory_row(1_200_000, "100-1000", "main", 100.0 * MIB, 100.0 * MIB),
+        ];
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 1_200_000,
+            },
+            600_000,
+        );
+        for lang in [Lang::En, Lang::Ru] {
+            let document = render(&build(&run, &summary, lang));
+            let (whole, steady, unit, growth) = match lang {
+                Lang::En => ("### Whole run", "### After warmup", "MB", "Growth"),
+                Lang::Ru => ("### Весь прогон", "### После прогрева", "МБ", "Рост"),
+            };
+            let whole = document_section(&document, whole);
+            let steady = document_section(&document, steady);
+            assert!(whole.contains(&format!(
+                "| Private bytes | 1000.0 {unit} | 1000.0 {unit} | 550.0 {unit} |"
+            )));
+            assert!(!whole.contains(growth));
+            assert!(steady.contains(&format!("| Private bytes | 100.0 {unit} | 100.0 {unit} | 100.0 {unit} | 100.0 {unit} | 100.0 {unit} |")));
+            assert!(steady.contains(growth));
+            assert!(whole.contains("[0:00, 20:00]"));
+            assert!(steady.contains("[10:00, 20:00]"));
+        }
+    }
+
+    #[test]
+    fn render_reports_each_cdp_target_without_a_total() {
+        let mut run = fixtures::empty_run();
+        run.cdp = vec![
+            target_sample(0, "B", Some(20.0 * MIB), Some(200.0)),
+            target_sample(1, "A", Some(10.0 * MIB), Some(100.0)),
+            target_sample(100, "B", Some(20.0 * MIB), None),
+            target_sample(101, "A", Some(10.0 * MIB), Some(100.0)),
+            target_sample(102, "C", None, None),
+        ];
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 102,
+            },
+            100,
+        );
+        for lang in [Lang::En, Lang::Ru] {
+            let document = render(&build(&run, &summary, lang));
+            let (cdp, target, samples, unit) = match lang {
+                Lang::En => ("## CDP targets", "CDP target", "Samples", "MB"),
+                Lang::Ru => ("## Источники CDP", "источник CDP", "Замеров", "МБ"),
+            };
+            let tree = document.split(cdp).next().expect("the tree section exists");
+            assert!(
+                !tree.contains("| JS heap"),
+                "multiple targets cannot supply primary JS rows"
+            );
+            let a = document_section(&document, &format!("### {target} A"));
+            let b = document_section(&document, &format!("### {target} B"));
+            let c = document_section(&document, &format!("### {target} C"));
+            assert!(a.contains(samples));
+            assert!(a.contains(&format!("| JS heap | 10.0 {unit} |")));
+            assert!(b.contains(&format!("| JS heap | 20.0 {unit} |")));
+            assert!(!document.contains(&format!("30.0 {unit}")));
+            let a_rows = metric_lines(a, "JS heap");
+            assert_eq!(a_rows.len(), 2);
+            assert!(a_rows[0].ends_with("| 2 |"));
+            assert!(a_rows[1].ends_with("| 1 |"));
+            let b_nodes = metric_lines(b, "DOM nodes");
+            assert!(b_nodes[0].ends_with("| 1 |"));
+            assert!(b_nodes[1].ends_with("| 0 |"));
+            assert!(
+                metric_lines(c, "JS heap")
+                    .iter()
+                    .all(|row| row.ends_with("| 0 |"))
+            );
+            assert!(
+                document.find(&format!("### {target} A")).unwrap()
+                    < document.find(&format!("### {target} B")).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn render_single_cdp_target_names_primary_scope() {
+        let dir = TempDir::new().expect("a temporary directory must be created");
+        let run_dir = fixtures::write_run(dir.path());
+        fs::write(run_dir.join("cdp.csv"), "t_ms,unix_ms,target_id,url,js_heap_used_bytes,nodes\n0,1000,page-1,https://private-url-marker.invalid/path,10485760,100\n100,1100,page-1,https://private-url-marker.invalid/path,10485760,100\n").expect("cdp.csv must be written");
+        let run = load(&run_dir).expect("the legacy CSV must load");
+        for lang in [Lang::En, Lang::Ru] {
+            let document = document_of(&run, lang);
+            let target = match lang {
+                Lang::En => "CDP target page-1",
+                Lang::Ru => "источник CDP page-1",
+            };
+            let primary = metric_lines(&document, &format!("JS heap ({target})"));
+            assert_eq!(
+                primary.len(),
+                2,
+                "each primary window must explicitly name its source"
+            );
+            let target_rows = metric_lines(
+                document_section(&document, &format!("### {target}")),
+                "JS heap",
+            );
+            assert_eq!(target_rows.len(), 2);
+            for (primary, target) in primary.iter().zip(target_rows) {
+                let primary: Vec<_> = primary.split('|').map(str::trim).collect();
+                let target: Vec<_> = target.split('|').map(str::trim).collect();
+                assert_eq!(&primary[2..primary.len() - 1], &target[2..target.len() - 2]);
+            }
+            assert!(!document.contains("private-url-marker"));
+            assert!(!document.contains(fixtures::CMDLINE_MARKER));
+            assert!(!document.contains(r"C:\app"));
+        }
+    }
+
+    #[test]
+    fn render_preserves_cdp_table_columns_for_hostile_ids() {
+        let dir = TempDir::new().expect("a temporary directory must be created");
+        let run_dir = fixtures::write_run(dir.path());
+        for (raw_id, literal_id) in HOSTILE_TARGET_IDS {
+            write_target_csv(&run_dir, &[raw_id]);
+            let run = load(&run_dir).expect("quoted CSV target identities must load");
+            let summary = summarize(
+                &run,
+                Window {
+                    start_ms: 0,
+                    end_ms: 100,
+                },
+                0,
+            );
+            assert_eq!(run.cdp[0].target_id.as_deref(), Some(raw_id));
+            assert_eq!(summary.primary_cdp_target.as_deref(), Some(raw_id));
+            assert_eq!(summary.cdp_targets[0].target_id, raw_id);
+
+            for lang in [Lang::En, Lang::Ru] {
+                let view = build(&run, &summary, lang);
+                assert_eq!(view.cdp_targets[0].target_id, raw_id);
+                let document = render(&view);
+                let (whole, steady, target_label, unit) = match lang {
+                    Lang::En => ("### Whole run", "### After warmup", "CDP target", "MB"),
+                    Lang::Ru => (
+                        "### Весь прогон",
+                        "### После прогрева",
+                        "источник CDP",
+                        "МБ",
+                    ),
+                };
+                for (heading, width) in [(whole, 8), (steady, 11)] {
+                    let section = document_section(&document, heading);
+                    for (metric, first) in [
+                        ("JS heap", format!("10.0 {unit}")),
+                        ("DOM nodes", "100".to_string()),
+                    ] {
+                        let rows: Vec<_> = section
+                            .lines()
+                            .filter(|line| line.starts_with(&format!("| {metric} (")))
+                            .collect();
+                        assert_eq!(
+                            rows.len(),
+                            1,
+                            "one complete {metric} row is required for {raw_id:?}"
+                        );
+                        let cells = gfm_cells(rows[0]);
+                        assert_eq!(
+                            cells.len(),
+                            width,
+                            "escaped pipes, including those between backticks, must not create columns: {raw_id:?}"
+                        );
+                        assert_eq!(cells[0], format!("{metric} ({target_label} {literal_id})"));
+                        assert_eq!(cells[1], first);
+                        assert_eq!(cells[2], first);
+                        assert_eq!(cells[3], first);
+                        assert_eq!(cells[6], first);
+                    }
+                }
+                assert!(!document.contains("private-url-marker"));
+                assert!(!document.contains(fixtures::CMDLINE_MARKER));
+                assert!(!document.contains(r"C:\app"));
+            }
+        }
+    }
+
+    #[test]
+    fn render_keeps_hostile_cdp_target_ids_in_literal_headings() {
+        let dir = TempDir::new().expect("a temporary directory must be created");
+        let run_dir = fixtures::write_run(dir.path());
+        let raw_ids: Vec<_> = HOSTILE_TARGET_IDS.iter().map(|(raw, _)| *raw).collect();
+        write_target_csv(&run_dir, &raw_ids);
+        let run = load(&run_dir).expect("quoted multiline identities must load");
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 100,
+            },
+            0,
+        );
+        assert_eq!(summary.primary_cdp_target, None);
+        let mut sorted = HOSTILE_TARGET_IDS.to_vec();
+        sorted.sort_by_key(|(raw, _)| *raw);
+        assert_eq!(
+            summary
+                .cdp_targets
+                .iter()
+                .map(|target| target.target_id.as_str())
+                .collect::<Vec<_>>(),
+            sorted.iter().map(|(raw, _)| *raw).collect::<Vec<_>>()
+        );
+
+        for lang in [Lang::En, Lang::Ru] {
+            let view = build(&run, &summary, lang);
+            assert_eq!(
+                view.cdp_targets
+                    .iter()
+                    .map(|target| target.target_id.as_str())
+                    .collect::<Vec<_>>(),
+                sorted.iter().map(|(raw, _)| *raw).collect::<Vec<_>>()
+            );
+            let document = render(&view);
+            let texts = texts(lang);
+            let mut expected_headings = vec![
+                "# ".to_string() + &fill(texts.title, &[("name", "synthetic")]),
+                format!("## {}", texts.heading_warnings),
+                format!("## {}", texts.heading_summary),
+                format!("### {}", texts.heading_whole_run),
+                format!("### {}", texts.heading_steady_state),
+                format!("### {}", texts.heading_totals),
+                format!("## {}", texts.heading_cdp_targets),
+            ];
+            for (_, literal_id) in &sorted {
+                expected_headings.extend([
+                    format!("### {}", fill(texts.target_label, &[("id", literal_id)])),
+                    format!("#### {}", texts.heading_whole_run),
+                    format!("#### {}", texts.heading_steady_state),
+                ]);
+            }
+            expected_headings.extend([
+                format!("## {}", texts.heading_roles),
+                format!("## {}", texts.heading_processes),
+            ]);
+            let actual_headings: Vec<_> = document
+                .lines()
+                .filter(|line| line.starts_with('#'))
+                .collect();
+            assert_eq!(
+                actual_headings, expected_headings,
+                "target identities must be literal single-line headings, not Markdown or injected sections"
+            );
+            let tree = document_section(&document, &format!("## {}", texts.heading_summary));
+            assert!(!tree.contains("| JS heap"));
+            assert!(!tree.contains("| DOM nodes"));
+            for (_, literal_id) in &sorted {
+                let target = document_section(
+                    &document,
+                    &format!("### {}", fill(texts.target_label, &[("id", literal_id)])),
+                );
+                for (heading, width) in [
+                    (texts.heading_whole_run, 9),
+                    (texts.heading_steady_state, 12),
+                ] {
+                    let window = document_section(target, &format!("#### {heading}"));
+                    for metric in ["JS heap", "DOM nodes"] {
+                        let rows = metric_lines(window, metric);
+                        assert_eq!(rows.len(), 1);
+                        let cells = gfm_cells(rows[0]);
+                        assert_eq!(cells.len(), width);
+                        assert_eq!(cells[width - 1], "2");
+                    }
+                }
+            }
+            assert!(!document.contains("private-url-marker"));
+            assert!(!document.contains(fixtures::CMDLINE_MARKER));
+            assert!(!document.contains(r"C:\app"));
+        }
+    }
+
+    /// Raw identities paired with literal Markdown source, not rendered markup.
+    const HOSTILE_TARGET_IDS: [(&str, &str); 5] = [
+        ("page|A", r"page\|A"),
+        (r"page\|A", r"page\\\|A"),
+        ("`page|A`", r"\`page\|A\`"),
+        (
+            "page\r\n## injected\n`title`",
+            r"page\\r\\n\#\# injected\\n\`title\`",
+        ),
+        (
+            "**bold**_[link](dest)_ <b> &copy; ###",
+            r"\*\*bold\*\*\_\[link\]\(dest\)\_ \<b\> \&copy; \#\#\#",
+        ),
+    ];
+
+    /// Writes quoted legacy CSV identities with two constant gauge samples each.
+    fn write_target_csv(run_dir: &Path, target_ids: &[&str]) {
+        let mut writer =
+            csv::Writer::from_path(run_dir.join("cdp.csv")).expect("cdp.csv must be created");
+        writer
+            .write_record([
+                "t_ms",
+                "unix_ms",
+                "target_id",
+                "url",
+                "js_heap_used_bytes",
+                "nodes",
+            ])
+            .expect("the header must be written");
+        for tick in [0, 100] {
+            for target_id in target_ids {
+                writer
+                    .write_record([
+                        tick.to_string(),
+                        (1000 + tick).to_string(),
+                        target_id.to_string(),
+                        "https://private-url-marker.invalid/path".to_string(),
+                        "10485760".to_string(),
+                        "100".to_string(),
+                    ])
+                    .expect("the quoted target row must be written");
+            }
+        }
+        writer.flush().expect("cdp.csv must be flushed");
+    }
+
+    /// Splits GFM cells at pipes not escaped by an odd number of backslashes.
+    fn gfm_cells(row: &str) -> Vec<&str> {
+        let mut cells = Vec::new();
+        let mut start = 0;
+        let mut backslashes = 0;
+        for (index, ch) in row.char_indices() {
+            if ch == '|' && backslashes % 2 == 0 {
+                cells.push(row[start..index].trim());
+                start = index + 1;
+            }
+            backslashes = if ch == '\\' { backslashes + 1 } else { 0 };
+        }
+        cells.push(row[start..].trim());
+        assert_eq!(
+            cells.first(),
+            Some(&""),
+            "a table row must start with a pipe"
+        );
+        assert_eq!(cells.pop(), Some(""), "a table row must end with a pipe");
+        cells.remove(0);
+        cells
+    }
+
+    #[test]
+    fn render_distinguishes_empty_steady_window_from_short_window() {
+        let mut run = fixtures::empty_run();
+        run.processes = vec![memory_row(0, "100-1000", "main", MIB, MIB)];
+        for lang in [Lang::En, Lang::Ru] {
+            let (heading, empty_window, empty_data, no_data, short) = match lang {
+                Lang::En => (
+                    "### After warmup",
+                    "No window after warmup",
+                    "No usable data after warmup",
+                    "no data",
+                    "run too short",
+                ),
+                Lang::Ru => (
+                    "### После прогрева",
+                    "Нет окна после прогрева",
+                    "Нет пригодных данных после прогрева",
+                    "нет данных",
+                    "прогон слишком короткий",
+                ),
+            };
+            for end_ms in [99, 200] {
+                let summary = summarize(
+                    &run,
+                    Window {
+                        start_ms: 0,
+                        end_ms,
+                    },
+                    100,
+                );
+                let document = render(&build(&run, &summary, lang));
+                let steady = document_section(&document, heading);
+                assert!(steady.contains(empty_data));
+                assert_eq!(steady.contains(empty_window), end_ms == 99);
+                if end_ms == 200 {
+                    assert!(
+                        steady.contains("[0:00.100, 0:00.200]"),
+                        "window captions must preserve subsecond inclusive boundaries"
+                    );
+                }
+                assert!(steady.contains(&format!(
+                    "| Private bytes | {} |",
+                    [no_data; 10].join(" | ")
+                )));
+                assert!(!steady.contains(short));
+            }
+            run.processes
+                .push(memory_row(100, "100-1000", "main", 2.0 * MIB, 2.0 * MIB));
+            let summary = summarize(
+                &run,
+                Window {
+                    start_ms: 0,
+                    end_ms: 200,
+                },
+                100,
+            );
+            let document = render(&build(&run, &summary, lang));
+            let steady = document_section(&document, heading);
+            assert!(!steady.contains(empty_data));
+            let row = metric_lines(steady, "Private bytes")[0];
+            assert!(row.ends_with(&format!("| {no_data} | {no_data} | {short} |")));
+            run.processes.pop();
+        }
+    }
+
+    #[test]
+    fn render_has_windowed_cpu_and_single_lifecycle_totals() {
+        let mut run = role_process_run();
+        for sample in &mut run.processes {
+            sample.cpu_pct = Some(if sample.t_ms == 0 { 45.0 } else { 10.0 });
+        }
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 60_000,
+            },
+            30_000,
+        );
+        for lang in [Lang::En, Lang::Ru] {
+            let document = render(&build(&run, &summary, lang));
+            let (whole, steady, labels, cpu_scope, peaks_scope) = match lang {
+                Lang::En => (
+                    "### Whole run",
+                    "### After warmup",
+                    EN.cpu_rows,
+                    "CPU %: 100% is the whole machine",
+                    "Roles and process peaks cover the whole run",
+                ),
+                Lang::Ru => (
+                    "### Весь прогон",
+                    "### После прогрева",
+                    RU.cpu_rows,
+                    "CPU %: 100% соответствует всей машине",
+                    "Роли и пики процессов относятся ко всему прогону",
+                ),
+            };
+            let whole = document_section(&document, whole);
+            let steady = document_section(&document, steady);
+            assert!(whole.contains(&format!("| {} | 36.67 |", labels[1])));
+            assert!(steady.contains(&format!("| {} | 10.00 |", labels[1])));
+            for label in &labels[1..4] {
+                assert_eq!(document.matches(&format!("| {label} |")).count(), 2);
+            }
+            for label in [labels[0], labels[4], labels[5], labels[6]] {
+                assert_eq!(document.matches(&format!("| {label} |")).count(), 1);
+            }
+            assert!(document.contains(cpu_scope));
+            assert!(document.contains(peaks_scope));
+        }
+    }
+
+    /// Returns a heading's body up to the next heading of the same or higher level.
+    fn document_section<'a>(document: &'a str, heading: &str) -> &'a str {
+        let level = heading.bytes().take_while(|byte| *byte == b'#').count();
+        let start = document
+            .find(&format!("{heading}\n"))
+            .unwrap_or_else(|| panic!("missing {heading}"))
+            + heading.len()
+            + 1;
+        let body = &document[start..];
+        let end = body
+            .match_indices("\n#")
+            .find_map(|(index, _)| {
+                let next_level = body[index + 1..]
+                    .bytes()
+                    .take_while(|byte| *byte == b'#')
+                    .count();
+                (next_level <= level).then_some(index)
+            })
+            .unwrap_or(body.len());
+        &body[..end]
+    }
+
+    /// Returns the Markdown rows whose first cell is exactly the metric label.
+    fn metric_lines<'a>(document: &'a str, label: &str) -> Vec<&'a str> {
+        document
+            .lines()
+            .filter(|line| line.starts_with(&format!("| {label} |")))
+            .collect()
+    }
+
+    /// Builds a target gauge row, preserving missing values as failed attempts.
+    fn target_sample(
+        t_ms: u64,
+        target_id: &str,
+        heap: Option<f64>,
+        nodes: Option<f64>,
+    ) -> crate::analyze::CdpSample {
+        crate::analyze::CdpSample {
+            t_ms,
+            unix_ms: t_ms,
+            target_id: Some(target_id.to_string()),
+            session_id: None,
+            js_heap_used_bytes: heap,
+            nodes,
+        }
+    }
+
+    #[test]
     fn view_marks_missing_metrics_with_no_data() {
         let mut run = fixtures::empty_run();
         run.processes = vec![
@@ -1074,9 +2214,11 @@ mod tests {
         let view = build(&run, &summary_of(&run), Lang::En);
 
         let rows = rows_by_label(&view);
-        for label in ["GPU dedicated", "GPU shared", "JS heap", "DOM nodes"] {
+        for label in ["GPU dedicated", "GPU shared"] {
             assert_eq!(rows[label][1..], ["no data"; 10], "{label}");
         }
+        assert!(!rows.contains_key("JS heap"));
+        assert!(!rows.contains_key("DOM nodes"));
         assert_eq!(rows["Private bytes"][1], "1.0 MB");
         assert_eq!(rows["Private bytes"][10], "run too short");
     }
@@ -1088,9 +2230,11 @@ mod tests {
         let view = build(&run, &summary_of(&run), Lang::Ru);
 
         let rows = rows_by_label(&view);
-        for label in ["GPU dedicated", "GPU shared", "JS heap", "DOM nodes"] {
+        for label in ["GPU dedicated", "GPU shared"] {
             assert_eq!(rows[label][1..], ["нет данных"; 10], "{label}");
         }
+        assert!(!rows.contains_key("JS heap"));
+        assert!(!rows.contains_key("DOM nodes"));
         assert_eq!(rows["Private bytes"][10], "прогон слишком короткий");
         assert_eq!(rows["Working set"][10], "прогон слишком короткий");
         assert_eq!(
@@ -1111,8 +2255,8 @@ mod tests {
                     "renderer.exe",
                     "—",
                     "0:00",
-                    "0:00",
-                    "0:00",
+                    "—",
+                    "—",
                     "0.5 МБ",
                     "1.0 МБ"
                 ],
@@ -1122,13 +2266,21 @@ mod tests {
 
     #[test]
     fn view_lists_warnings() {
-        let run = fixtures::empty_run();
+        let mut run = fixtures::empty_run();
+        run.meta.collectors.remove("cdp");
+        run.meta
+            .env_overrides
+            .remove("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
         assert_eq!(
             build(&run, &summary_of(&run), Lang::En).warnings,
             Vec::<String>::new()
         );
 
         let mut run = fixtures::empty_run();
+        run.meta.collectors.remove("cdp");
+        run.meta
+            .env_overrides
+            .remove("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
         run.warnings = vec![Warning {
             kind: WarningKind::NoData,
             message: WarningMessage::MissingFile {
@@ -1194,7 +2346,8 @@ mod tests {
         let view = build(&run, &summary_of(&run), Lang::En);
 
         let labels: Vec<&str> = view
-            .summary_rows
+            .whole_run
+            .metric_rows
             .iter()
             .map(|row| row[0].as_str())
             .collect();
@@ -1205,20 +2358,27 @@ mod tests {
                 "Working set",
                 "GPU dedicated",
                 "GPU shared",
-                "JS heap",
-                "DOM nodes",
                 "Handles",
                 "GDI",
                 "USER",
                 "Threads",
             ]
         );
-        assert_eq!(view.summary_rows[0][0], "Private bytes");
-        assert_eq!(view.summary_rows[9][0], "Threads");
+        assert_eq!(view.whole_run.metric_rows[0][0], "Private bytes");
+        assert_eq!(view.whole_run.metric_rows[7][0], "Threads");
         assert!(
-            view.summary_rows.iter().all(|row| row.len() == 11),
-            "every summary row must have eleven cells"
+            view.whole_run.metric_rows.iter().all(|row| row.len() == 8),
+            "every whole-run row must have eight cells"
         );
+        assert!(
+            view.steady_state
+                .metric_rows
+                .iter()
+                .all(|row| row.len() == 11)
+        );
+        assert_eq!(view.whole_run.cpu_rows.len(), 3);
+        assert_eq!(view.steady_state.cpu_rows.len(), 3);
+        assert_eq!(view.totals_rows.len(), 4);
     }
 
     #[test]
@@ -1245,8 +2405,8 @@ mod tests {
                     "renderer.exe",
                     "—",
                     "0:00",
-                    "0:00",
-                    "0:00",
+                    "—",
+                    "—",
                     "0.5 MB",
                     "1.0 MB"
                 ],
@@ -1480,12 +2640,17 @@ mod tests {
         let document = document_of(&run, Lang::En);
 
         assert!(document.contains("| GPU dedicated | no data |"));
-        assert!(document.contains("| JS heap | no data |"));
+        assert!(!document.contains("| JS heap"));
+        assert!(document_section(&document, "## CDP targets").contains("no data"));
     }
 
     #[test]
     fn render_lists_warnings() {
         let mut run = fixtures::empty_run();
+        run.meta.collectors.remove("cdp");
+        run.meta
+            .env_overrides
+            .remove("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
         run.warnings = vec![Warning {
             kind: WarningKind::NoData,
             message: WarningMessage::MissingFile {
@@ -1495,7 +2660,11 @@ mod tests {
 
         assert!(document_of(&run, Lang::En).contains("- no data: missing file gpu.csv"));
 
-        let run = fixtures::empty_run();
+        let mut run = fixtures::empty_run();
+        run.meta.collectors.remove("cdp");
+        run.meta
+            .env_overrides
+            .remove("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
         assert!(document_of(&run, Lang::En).contains("No warnings"));
     }
 

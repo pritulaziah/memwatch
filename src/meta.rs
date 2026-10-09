@@ -69,6 +69,9 @@ pub struct Meta {
     /// Whether the process collector switched to walking the tree by parent
     /// PID.
     pub tree_walk_fallback: bool,
+    /// Processes whose exit was not confirmed by the end of shutdown.
+    #[serde(default)]
+    pub shutdown_issues: Vec<ShutdownIssue>,
 }
 
 impl Meta {
@@ -129,6 +132,7 @@ impl Meta {
             images: Vec::new(),
             collectors,
             tree_walk_fallback: false,
+            shutdown_issues: Vec::new(),
         }
     }
 
@@ -171,6 +175,49 @@ impl Display for EndReason {
         };
         f.write_str(value)
     }
+}
+
+/// Observed state of a process whose exit was not confirmed during shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownState {
+    /// The process was still running at the end of shutdown.
+    Alive,
+    /// The process state could not be determined at the end of shutdown.
+    Unknown,
+}
+
+/// Reason a process exit could not be confirmed during shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownReason {
+    /// Access to the process was denied.
+    AccessDenied,
+    /// The original process identity was unavailable.
+    IdentityUnknown,
+    /// The candidate no longer matched the original process identity.
+    IdentityChanged,
+    /// Querying the process identity or state failed.
+    QueryFailed,
+    /// The verified process could not be terminated.
+    TerminateFailed,
+    /// The process exit was not confirmed before the wait deadline.
+    WaitTimeout,
+}
+
+/// A tracked process whose exit was not confirmed by the end of shutdown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShutdownIssue {
+    /// Process ID observed in the tracked tree.
+    pub pid: u32,
+    /// Stable process identity, when known.
+    pub proc_key: Option<String>,
+    /// Observed process role.
+    pub role: String,
+    /// Process state at the end of shutdown.
+    pub state: ShutdownState,
+    /// Reason the process exit could not be confirmed.
+    pub reason: ShutdownReason,
 }
 
 /// State of one collector, written to `meta.json` as a string.
@@ -489,6 +536,90 @@ mod tests {
     }
 
     #[test]
+    fn meta_serializes_shutdown_issues() {
+        let meta = Meta::new(&sample_options(), sample_started(), sample_host());
+        let mut value = serde_json::to_value(&meta).expect("the metadata must serialize");
+        assert_eq!(value.get("shutdown_issues"), Some(&serde_json::json!([])));
+
+        let reasons = [
+            "access_denied",
+            "identity_unknown",
+            "identity_changed",
+            "query_failed",
+            "terminate_failed",
+            "wait_timeout",
+        ];
+        let issues: Vec<_> = reasons
+            .iter()
+            .enumerate()
+            .map(|(index, reason)| {
+                serde_json::json!({
+                    "pid": 100 + index,
+                    "proc_key": if index % 2 == 0 { Some("100-1000") } else { None },
+                    "role": "renderer",
+                    "state": if index % 2 == 0 { "alive" } else { "unknown" },
+                    "reason": reason,
+                })
+            })
+            .collect();
+        value["shutdown_issues"] = serde_json::json!(issues);
+        let parsed: Meta = serde_json::from_value(value.clone()).expect("the issues must parse");
+        let typed_reasons = [
+            ShutdownReason::AccessDenied,
+            ShutdownReason::IdentityUnknown,
+            ShutdownReason::IdentityChanged,
+            ShutdownReason::QueryFailed,
+            ShutdownReason::TerminateFailed,
+            ShutdownReason::WaitTimeout,
+        ];
+        let expected: Vec<_> = typed_reasons
+            .iter()
+            .enumerate()
+            .map(|(index, reason)| ShutdownIssue {
+                pid: 100 + index as u32,
+                proc_key: (index % 2 == 0).then(|| "100-1000".to_string()),
+                role: "renderer".to_string(),
+                state: if index % 2 == 0 {
+                    ShutdownState::Alive
+                } else {
+                    ShutdownState::Unknown
+                },
+                reason: *reason,
+            })
+            .collect();
+        assert_eq!(parsed.shutdown_issues, expected);
+        assert_eq!(
+            serde_json::to_value(&parsed).expect("the issues must serialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn meta_reads_legacy_metadata_without_shutdown_issues() {
+        let meta = Meta::new(&sample_options(), sample_started(), sample_host());
+        let mut value = serde_json::to_value(&meta).expect("the metadata must serialize");
+        value.as_object_mut().unwrap().remove("shutdown_issues");
+        let parsed: Meta =
+            serde_json::from_value(value.clone()).expect("legacy metadata must parse");
+        assert!(parsed.shutdown_issues.is_empty());
+        let restored = serde_json::to_value(&parsed).expect("the metadata must serialize");
+        assert_eq!(
+            restored.get("shutdown_issues"),
+            Some(&serde_json::json!([]))
+        );
+        assert_eq!(parsed.schema_version, 1);
+
+        value["collectors"]["cdp"] = serde_json::json!("other");
+        assert!(serde_json::from_value::<Meta>(value.clone()).is_err());
+        value["collectors"]["cdp"] = serde_json::json!("waiting");
+        for field in ["tree_walk_fallback", "collectors", "intervals_ms"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Meta>(missing).is_err(), "{field}");
+        }
+    }
+
+    #[test]
     fn meta_serializes_pinned_field_names() {
         let mut meta = Meta::new(&sample_options(), sample_started(), sample_host());
         meta.images.push(ImageInfo {
@@ -517,6 +648,7 @@ mod tests {
                 "memwatch_version",
                 "name",
                 "schema_version",
+                "shutdown_issues",
                 "started_at",
                 "tree_walk_fallback",
             ]

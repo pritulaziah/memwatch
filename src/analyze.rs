@@ -116,6 +116,10 @@ pub struct CdpSample {
     pub t_ms: u64,
     /// Unix time in milliseconds.
     pub unix_ms: u64,
+    /// DevTools target identity; `None` when absent or empty.
+    pub target_id: Option<String>,
+    /// Positive measurement session ID; `None` when absent, empty or invalid.
+    pub session_id: Option<u64>,
     /// Used JavaScript heap in bytes.
     pub js_heap_used_bytes: Option<f64>,
     /// DOM nodes in the page.
@@ -154,6 +158,12 @@ pub enum WarningKind {
     TreeWalkFallback,
     /// The run ended for an unexpected reason.
     UnexpectedEndReason,
+    /// Requested CDP gauges are missing or the final source is unavailable.
+    CdpData,
+    /// CDP rows have no known measurement source identity.
+    CdpIdentity,
+    /// A tracked process exit was not confirmed during shutdown.
+    Shutdown,
 }
 
 /// Parameters of a [`Warning`], sufficient to render it in any language.
@@ -190,6 +200,25 @@ pub enum WarningMessage {
         name: String,
         /// Final status of the collector.
         status: CollectorStatus,
+    },
+    /// Requested CDP gauges have no usable samples in the whole-run window.
+    CdpMetricsMissing {
+        /// Target identity, or `None` for global absence across all targets.
+        target_id: Option<String>,
+        /// Missing JS heap or DOM nodes metric, or `None` for both gauges.
+        metric: Option<MetricId>,
+    },
+    /// A completed run ended while the CDP source was unavailable.
+    CdpWaiting,
+    /// Raw CDP rows without target identity were excluded from statistics.
+    CdpTargetIdentityMissing {
+        /// Number of excluded raw rows.
+        rows: usize,
+    },
+    /// A process whose exit was not confirmed by the end of shutdown.
+    ShutdownIssue {
+        /// Recorded process identity, role, state and coded reason.
+        issue: crate::meta::ShutdownIssue,
     },
     /// The process collector switched to walking the tree.
     TreeWalkFallback,
@@ -486,6 +515,13 @@ impl Table {
     fn number(&self, row: &TableRow, column: &str) -> Option<f64> {
         self.cell(row, column).and_then(|cell| cell.parse().ok())
     }
+
+    /// Returns a positive integer cell without converting through floating point.
+    fn positive_u64(&self, row: &TableRow, column: &str) -> Option<u64> {
+        self.cell(row, column)
+            .and_then(|cell| cell.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+    }
 }
 
 /// Reads `meta.json`, validating its schema version.
@@ -550,6 +586,8 @@ fn read_group<T>(
 /// decreasing `t_ms` is dropped. A non-numeric cell of a numeric column counts
 /// once per file; an empty cell reads as `None` in any column. Reading stops at
 /// the first parse error, so a torn tail is ignored.
+/// CDP session IDs must be positive integers, and its analyzed gauges must be
+/// finite and non-negative; unusable non-empty cells also produce a warning.
 fn read_table(path: &Path, numeric_columns: &[&str]) -> TableRead {
     let Ok(file) = fs::File::open(path) else {
         return TableRead::Missing;
@@ -576,6 +614,12 @@ fn read_table(path: &Path, numeric_columns: &[&str]) -> TableRead {
 
     let t_ms_index = header.iter().position(|column| column == "t_ms");
     let unix_ms_index = header.iter().position(|column| column == "unix_ms");
+    let is_cdp = numeric_columns == CDP_NUMERIC;
+    let session_id_index = if is_cdp {
+        header.iter().position(|column| column == "session_id")
+    } else {
+        None
+    };
     let numeric: Vec<bool> = header
         .iter()
         .map(|column| numeric_columns.contains(&column.as_str()))
@@ -612,7 +656,19 @@ fn read_table(path: &Path, numeric_columns: &[&str]) -> TableRead {
                 continue;
             }
             let cell = &record[index];
-            if !cell.is_empty() && cell.parse::<f64>().is_err() {
+            let is_gauge =
+                is_cdp && matches!(header[index].as_str(), "js_heap_used_bytes" | "nodes");
+            if !cell.is_empty()
+                && !cell
+                    .parse::<f64>()
+                    .is_ok_and(|value| !is_gauge || (value.is_finite() && value >= 0.0))
+            {
+                non_numeric += 1;
+            }
+        }
+        if let Some(index) = session_id_index {
+            let cell = &record[index];
+            if !cell.is_empty() && !cell.parse::<u64>().is_ok_and(|value| value > 0) {
                 non_numeric += 1;
             }
         }
@@ -717,8 +773,14 @@ fn cdp_samples(table: &Table) -> Vec<CdpSample> {
         .map(|row| CdpSample {
             t_ms: row.t_ms,
             unix_ms: row.unix_ms,
-            js_heap_used_bytes: table.number(row, "js_heap_used_bytes"),
-            nodes: table.number(row, "nodes"),
+            target_id: table.text(row, "target_id"),
+            session_id: table.positive_u64(row, "session_id"),
+            js_heap_used_bytes: table
+                .number(row, "js_heap_used_bytes")
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            nodes: table
+                .number(row, "nodes")
+                .filter(|value| value.is_finite() && *value >= 0.0),
         })
         .collect()
 }
@@ -776,7 +838,7 @@ fn recover_ended_at(meta: &Meta, last_t_ms: u64) -> (Option<String>, bool) {
 /// A named metric sampled at strictly increasing run ticks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Series {
-    /// Role, `proc_key` or `tree`.
+    /// Role, `proc_key`, target ID or `tree`.
     pub name: String,
     /// Ticks in milliseconds, strictly increasing.
     pub xs: Vec<u64>,
@@ -888,11 +950,59 @@ pub fn gpu_series(run: &Run, value: impl Fn(&GpuSample) -> Option<f64>) -> Optio
     group_series(&run.gpu, |sample| sample.t_ms, value)
 }
 
-/// Sums the present values of every `cdp.csv` row of a tick.
+/// Returns all non-empty recorded CDP target IDs, sorted and deduplicated.
 ///
-/// Returns `None` when the table has no rows.
-pub fn cdp_series(run: &Run, value: impl Fn(&CdpSample) -> Option<f64>) -> Option<Series> {
-    group_series(&run.cdp, |sample| sample.t_ms, value)
+/// Includes targets with no usable gauges, regardless of the selected window.
+pub fn cdp_target_ids(run: &Run) -> Vec<String> {
+    let mut targets: Vec<String> = run
+        .cdp
+        .iter()
+        .filter_map(|sample| sample.target_id.as_ref())
+        .filter(|target_id| !target_id.is_empty())
+        .cloned()
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+/// Builds a gauge series on one known target's sorted, unique recorded ticks.
+///
+/// The last recorded row wins on timestamp ties, including empty or unusable
+/// values. Only finite, non-negative values are retained. Gauges may span
+/// measurement sessions; cumulative continuity across sessions is not implied.
+/// Returns `None` for an empty target ID or a target with no recorded rows.
+pub fn cdp_series(
+    run: &Run,
+    target_id: &str,
+    value: impl Fn(&CdpSample) -> Option<f64>,
+) -> Option<Series> {
+    if target_id.is_empty() {
+        return None;
+    }
+    let mut rows = BTreeMap::new();
+    for sample in &run.cdp {
+        if sample.target_id.as_deref() == Some(target_id) {
+            rows.insert(sample.t_ms, sample);
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let (xs, values) = rows
+        .into_iter()
+        .map(|(t_ms, sample)| {
+            (
+                t_ms,
+                value(sample).filter(|value| value.is_finite() && *value >= 0.0),
+            )
+        })
+        .unzip();
+    Some(Series {
+        name: target_id.to_string(),
+        xs,
+        values,
+    })
 }
 
 /// Sums the present values of every `system.csv` row of a tick.
@@ -1029,7 +1139,20 @@ pub struct MetricStats {
     pub samples: usize,
 }
 
-/// CPU time and usage of a run.
+/// CPU percentage statistics for one analysis window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CpuPercentStats {
+    /// Mean tree CPU percentage over the window.
+    pub mean_pct: Option<f64>,
+    /// Median tree CPU percentage over the window.
+    pub p50_pct: Option<f64>,
+    /// 95th percentile of the tree CPU percentage over the window.
+    pub p95_pct: Option<f64>,
+    /// Number of present tree CPU percentage values in the window.
+    pub samples: usize,
+}
+
+/// Cumulative CPU time of the whole run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CpuStats {
     /// Total CPU seconds of the run.
@@ -1037,12 +1160,6 @@ pub struct CpuStats {
     /// Whether the CPU seconds came from the last process rows instead of the
     /// last job row.
     pub from_process_rows: bool,
-    /// Mean tree CPU percentage over the window.
-    pub mean_pct: Option<f64>,
-    /// Median tree CPU percentage over the window.
-    pub p50_pct: Option<f64>,
-    /// 95th percentile of the tree CPU percentage over the window.
-    pub p95_pct: Option<f64>,
 }
 
 /// Process lifecycle counters of a run.
@@ -1056,20 +1173,50 @@ pub struct ProcessStats {
     pub max_concurrent: usize,
 }
 
-/// Computed totals of a run over a window.
+/// Computed primary metrics and CPU percentages of one analysis window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowSummary {
+    /// Inclusive window, or `None` when its boundaries would be reversed.
+    pub window: Option<Window>,
+    /// Windows/GPU metrics and CDP gauges only for a single recorded target.
+    pub metrics: BTreeMap<MetricId, MetricStats>,
+    /// Tree CPU percentage statistics over this window.
+    pub cpu: CpuPercentStats,
+    /// Whether the window spans less than two hours.
+    pub too_short_for_hour_delta: bool,
+    /// Whether any primary, CPU or target metric has usable data in this window.
+    pub has_data: bool,
+}
+
+/// Independent JS heap and DOM node statistics of one recorded CDP source.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CdpTargetSummary {
+    /// Non-empty recorded target identity, not its URL.
+    pub target_id: String,
+    /// The two gauge metrics over the whole-run window, without trends.
+    pub whole_run: BTreeMap<MetricId, MetricStats>,
+    /// The two gauge metrics over the after-warmup window, including trends.
+    pub steady_state: BTreeMap<MetricId, MetricStats>,
+}
+
+/// Computed windows, independent CDP sources and whole-run totals.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Summary {
-    /// Window the totals were computed over.
+    /// Original requested window, also used for whole-run warnings.
     pub window: Window,
-    /// Warmup that growth and hour deltas exclude.
+    /// Run-relative threshold excluded from all steady-state statistics.
     pub warmup_ms: u64,
-    /// Whether the run is too short for an hour delta.
-    pub too_short_for_hour_delta: bool,
-    /// One entry per metric, all of [`MetricId::ALL`].
-    pub metrics: BTreeMap<MetricId, MetricStats>,
-    /// CPU totals of the run.
+    /// Statistics over the original window, without growth or hour deltas.
+    pub whole_run: WindowSummary,
+    /// Statistics at or after the warmup threshold, including trends.
+    pub steady_state: WindowSummary,
+    /// Primary CDP source only when exactly one target is known in the entire run.
+    pub primary_cdp_target: Option<String>,
+    /// All recorded CDP targets in alphabetical order, including failed sources.
+    pub cdp_targets: Vec<CdpTargetSummary>,
+    /// Cumulative CPU totals of the entire run, not sliced by either window.
     pub cpu: CpuStats,
-    /// Process lifecycle counters.
+    /// Process lifecycle counters of the entire run.
     pub processes: ProcessStats,
 }
 
@@ -1128,51 +1275,160 @@ pub fn metric_stats(series: Option<&Series>, window: Window, warmup_ms: u64) -> 
     }
 }
 
-/// Computes the metric, CPU and process summaries of a run over a window.
+/// Summarizes one complete window, optionally including growth and hour deltas.
+///
+/// An absent window returns empty statistics without falling back to startup data.
+pub fn window_metric_stats(
+    series: Option<&Series>,
+    window: Option<Window>,
+    include_growth: bool,
+) -> MetricStats {
+    let mut stats = match window {
+        Some(window) => metric_stats(series, window, window.start_ms),
+        None => metric_stats(
+            None,
+            Window {
+                start_ms: 0,
+                end_ms: 0,
+            },
+            0,
+        ),
+    };
+    if !include_growth {
+        stats.growth_per_hour = None;
+        stats.r2 = None;
+        stats.median_hour_delta = None;
+    }
+    stats
+}
+
+/// Computes tree CPU percentage statistics inside an optional inclusive window.
+pub fn cpu_percent_stats(series: Option<&Series>, window: Option<Window>) -> CpuPercentStats {
+    let values: Vec<f64> = window
+        .map(|window| window_points(series, window))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    CpuPercentStats {
+        mean_pct: (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64),
+        p50_pct: percentile(&values, 0.5),
+        p95_pct: percentile(&values, 0.95),
+        samples: values.len(),
+    }
+}
+
+/// Computes primary metrics, tree CPU percentages and data availability in a window.
+pub fn summarize_window(run: &Run, window: Option<Window>, include_growth: bool) -> WindowSummary {
+    let targets = cdp_target_ids(run);
+    let metrics: BTreeMap<MetricId, MetricStats> = MetricId::ALL
+        .into_iter()
+        .filter(|metric| {
+            !matches!(metric, MetricId::JsHeapUsedBytes | MetricId::DomNodes) || targets.len() == 1
+        })
+        .map(|metric| {
+            (
+                metric,
+                window_metric_stats(source_series(run, metric).as_ref(), window, include_growth),
+            )
+        })
+        .collect();
+    let cpu = cpu_percent_stats(tree_series(run, |sample| sample.cpu_pct).as_ref(), window);
+    let has_data = cpu.samples > 0
+        || metrics.values().any(|stats| stats.samples > 0)
+        || targets.iter().any(|target_id| {
+            [MetricId::JsHeapUsedBytes, MetricId::DomNodes]
+                .into_iter()
+                .any(|metric| {
+                    let series = cdp_series(run, target_id, |sample| match metric {
+                        MetricId::JsHeapUsedBytes => sample.js_heap_used_bytes,
+                        _ => sample.nodes,
+                    });
+                    window.is_some_and(|window| !window_points(series.as_ref(), window).is_empty())
+                })
+        });
+    WindowSummary {
+        window,
+        metrics,
+        cpu,
+        too_short_for_hour_delta: window
+            .is_none_or(|window| window.end_ms.saturating_sub(window.start_ms) < 7_200_000),
+        has_data,
+    }
+}
+
+/// Computes whole-run and after-warmup windows, target statistics and run totals.
 pub fn summarize(run: &Run, window: Window, warmup_ms: u64) -> Summary {
     let threshold = window.start_ms.max(warmup_ms);
-    let mut metrics = BTreeMap::new();
-    for metric in MetricId::ALL {
-        metrics.insert(
-            metric,
-            metric_stats(source_series(run, metric).as_ref(), window, warmup_ms),
-        );
-    }
-    let cpu_values: Vec<f64> =
-        window_points(tree_series(run, |sample| sample.cpu_pct).as_ref(), window)
-            .into_iter()
-            .map(|(_, value)| value)
-            .collect();
+    let whole_window = (window.start_ms <= window.end_ms).then_some(window);
+    let steady_window = (threshold <= window.end_ms).then_some(Window {
+        start_ms: threshold,
+        end_ms: window.end_ms,
+    });
+    let targets = cdp_target_ids(run);
+    let primary_cdp_target = (targets.len() == 1).then(|| targets[0].clone());
+    let cdp_targets = targets
+        .into_iter()
+        .map(|target_id| {
+            let mut whole_run = BTreeMap::new();
+            let mut steady_state = BTreeMap::new();
+            for metric in [MetricId::JsHeapUsedBytes, MetricId::DomNodes] {
+                let series = cdp_series(run, &target_id, |sample| match metric {
+                    MetricId::JsHeapUsedBytes => sample.js_heap_used_bytes,
+                    _ => sample.nodes,
+                });
+                whole_run.insert(
+                    metric,
+                    window_metric_stats(series.as_ref(), whole_window, false),
+                );
+                steady_state.insert(
+                    metric,
+                    window_metric_stats(series.as_ref(), steady_window, true),
+                );
+            }
+            CdpTargetSummary {
+                target_id,
+                whole_run,
+                steady_state,
+            }
+        })
+        .collect();
     let (total_seconds, from_process_rows) = cpu_seconds(run);
     Summary {
         window,
         warmup_ms,
-        too_short_for_hour_delta: window.end_ms.saturating_sub(threshold) < 7_200_000,
-        metrics,
+        whole_run: summarize_window(run, whole_window, false),
+        steady_state: summarize_window(run, steady_window, true),
+        primary_cdp_target,
+        cdp_targets,
         cpu: CpuStats {
             total_seconds,
             from_process_rows,
-            mean_pct: if cpu_values.is_empty() {
-                None
-            } else {
-                Some(cpu_values.iter().sum::<f64>() / cpu_values.len() as f64)
-            },
-            p50_pct: percentile(&cpu_values, 0.5),
-            p95_pct: percentile(&cpu_values, 0.95),
         },
         processes: process_stats(run),
     }
 }
 
-/// Returns the tree series of a metric from its source table.
+/// Returns a metric's source series, using CDP only for a single recorded target.
 fn source_series(run: &Run, metric: MetricId) -> Option<Series> {
     match metric {
         MetricId::PrivateBytes => tree_series(run, |sample| sample.private_bytes),
         MetricId::WorkingSet => tree_series(run, |sample| sample.working_set),
         MetricId::GpuDedicatedBytes => gpu_series(run, |sample| sample.dedicated_bytes),
         MetricId::GpuSharedBytes => gpu_series(run, |sample| sample.shared_bytes),
-        MetricId::JsHeapUsedBytes => cdp_series(run, |sample| sample.js_heap_used_bytes),
-        MetricId::DomNodes => cdp_series(run, |sample| sample.nodes),
+        MetricId::JsHeapUsedBytes | MetricId::DomNodes => {
+            let targets = cdp_target_ids(run);
+            let [target_id] = targets.as_slice() else {
+                return None;
+            };
+            cdp_series(run, target_id, |sample| {
+                if metric == MetricId::JsHeapUsedBytes {
+                    sample.js_heap_used_bytes
+                } else {
+                    sample.nodes
+                }
+            })
+        }
         MetricId::Handles => tree_series(run, |sample| sample.handles),
         MetricId::Gdi => tree_series(run, |sample| sample.gdi),
         MetricId::User => tree_series(run, |sample| sample.user),
@@ -1356,7 +1612,8 @@ const NOISE_THRESHOLD_PCT: f64 = 20.0;
 /// Collects the reading warnings of a run first, then the computed ones.
 ///
 /// The computed warnings follow in this order: wall-clock gaps, machine noise,
-/// collector statuses, the tree-walk fallback and the end reason.
+/// collector statuses, CDP diagnostics, the tree-walk fallback, shutdown issues
+/// and the end reason. Identical messages preserve only their first occurrence.
 pub fn compute_warnings(run: &Run, summary: &Summary) -> Vec<Warning> {
     let mut warnings = run.warnings.clone();
     warnings.extend(time_gap_warnings(run, summary));
@@ -1364,16 +1621,116 @@ pub fn compute_warnings(run: &Run, summary: &Summary) -> Vec<Warning> {
         warnings.push(noisy);
     }
     warnings.extend(collector_status_warnings(run));
+    warnings.extend(cdp_data_warnings(run, summary));
     if run.meta.tree_walk_fallback {
         warnings.push(Warning {
             kind: WarningKind::TreeWalkFallback,
             message: WarningMessage::TreeWalkFallback,
         });
     }
+    warnings.extend(shutdown_warnings(&run.meta));
     if let Some(unexpected) = unexpected_end_reason_warning(run) {
         warnings.push(unexpected);
     }
+    let mut unique = Vec::new();
+    for warning in warnings {
+        if !unique
+            .iter()
+            .any(|prior: &Warning| prior.message == warning.message)
+        {
+            unique.push(warning);
+        }
+    }
+    unique
+}
+
+/// Returns whether metadata records an enabled CDP source or a saved request.
+fn cdp_requested(meta: &Meta) -> bool {
+    meta.collectors
+        .get("cdp")
+        .is_some_and(|status| *status != CollectorStatus::Disabled)
+        || meta
+            .env_overrides
+            .get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+            .is_some_and(|arguments| {
+                arguments.split_whitespace().any(|token| {
+                    token
+                        .strip_prefix("--remote-debugging-port=")
+                        .is_some_and(|value| !value.is_empty())
+                })
+            })
+}
+
+/// Diagnoses whole-run gauge availability using the same deduplicated target
+/// series as the summary, without treating usable counts as coverage percentages.
+fn cdp_data_warnings(run: &Run, summary: &Summary) -> Vec<Warning> {
+    let mut warnings = Vec::new();
+    if cdp_requested(&run.meta) {
+        let metrics = [MetricId::JsHeapUsedBytes, MetricId::DomNodes];
+        let present = metrics.map(|metric| {
+            summary
+                .cdp_targets
+                .iter()
+                .any(|target| target.whole_run[&metric].samples > 0)
+        });
+        let missing = |target_id, heap_missing, nodes_missing| {
+            let metric = match (heap_missing, nodes_missing) {
+                (true, true) => None,
+                (true, false) => Some(MetricId::JsHeapUsedBytes),
+                (false, true) => Some(MetricId::DomNodes),
+                (false, false) => return None,
+            };
+            Some(Warning {
+                kind: WarningKind::CdpData,
+                message: WarningMessage::CdpMetricsMissing { target_id, metric },
+            })
+        };
+        if let Some(warning) = missing(None, !present[0], !present[1]) {
+            warnings.push(warning);
+        }
+        for target in &summary.cdp_targets {
+            if let Some(warning) = missing(
+                Some(target.target_id.clone()),
+                present[0] && target.whole_run[&metrics[0]].samples == 0,
+                present[1] && target.whole_run[&metrics[1]].samples == 0,
+            ) {
+                warnings.push(warning);
+            }
+        }
+    }
+    if run.meta.ended_at.is_some()
+        && run.meta.collectors.get("cdp") == Some(&CollectorStatus::Waiting)
+    {
+        warnings.push(Warning {
+            kind: WarningKind::CdpData,
+            message: WarningMessage::CdpWaiting,
+        });
+    }
+    let rows = run
+        .cdp
+        .iter()
+        .filter(|sample| sample.target_id.as_ref().is_none_or(String::is_empty))
+        .count();
+    if rows > 0 {
+        warnings.push(Warning {
+            kind: WarningKind::CdpIdentity,
+            message: WarningMessage::CdpTargetIdentityMissing { rows },
+        });
+    }
     warnings
+}
+
+/// Builds one final warning per recorded process with an unconfirmed exit.
+fn shutdown_warnings(meta: &Meta) -> Vec<Warning> {
+    meta.shutdown_issues
+        .iter()
+        .map(|issue| Warning {
+            kind: WarningKind::Shutdown,
+            message: WarningMessage::ShutdownIssue {
+                issue: issue.clone(),
+            },
+        })
+        .collect()
 }
 
 /// Returns the unique ticks of `process.csv` with their wall-clock time, or the
@@ -1568,6 +1925,7 @@ pub(crate) mod fixtures {
             ],
             collectors,
             tree_walk_fallback: false,
+            shutdown_issues: Vec::new(),
         }
     }
 
@@ -1820,6 +2178,164 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn load_cdp_preserves_target_and_session_identity() {
+        let dir = TempDir::new().expect("the temporary directory must be created");
+        let run_dir = fixtures::write_run(dir.path());
+        fs::write(
+            run_dir.join("cdp.csv"),
+            "nodes,session_id,target_id,unix_ms,js_heap_used_bytes,t_ms\n\
+             4,9007199254740993,page-A,1000,10,0\n\
+             5,18446744073709551615,page-B,1001,20,1\n",
+        )
+        .expect("cdp.csv must be written");
+
+        let run = load(&run_dir).expect("the run must load");
+
+        assert_eq!(run.cdp.len(), 2);
+        assert_eq!(run.cdp[0].target_id.as_deref(), Some("page-A"));
+        assert_eq!(run.cdp[0].session_id, Some(9_007_199_254_740_993));
+        assert_eq!(run.cdp[1].target_id.as_deref(), Some("page-B"));
+        assert_eq!(run.cdp[1].session_id, Some(u64::MAX));
+        assert_eq!(run.cdp[0].t_ms, 0);
+        assert_eq!(run.cdp[0].unix_ms, 1000);
+        assert_eq!(run.cdp[0].js_heap_used_bytes, Some(10.0));
+        assert_eq!(run.cdp[0].nodes, Some(4.0));
+        assert_eq!(run.cdp[1].t_ms, 1);
+        assert_eq!(run.cdp[1].unix_ms, 1001);
+        assert_eq!(run.cdp[1].js_heap_used_bytes, Some(20.0));
+        assert_eq!(run.cdp[1].nodes, Some(5.0));
+        assert!(run.warnings.is_empty());
+    }
+
+    #[test]
+    fn load_cdp_reads_legacy_session_as_unknown() {
+        let dir = TempDir::new().expect("the temporary directory must be created");
+        let run_dir = fixtures::write_run(dir.path());
+        for (content, target_id) in [
+            (
+                "target_id,t_ms,unix_ms,js_heap_used_bytes,nodes\npage-1,0,1000,10,2\n",
+                Some("page-1"),
+            ),
+            (
+                "target_id,t_ms,unix_ms,js_heap_used_bytes,nodes,session_id\npage-1,0,1000,10,2,\n",
+                Some("page-1"),
+            ),
+            (
+                "target_id,t_ms,unix_ms,js_heap_used_bytes,nodes\n,0,1000,10,2\n",
+                None,
+            ),
+            ("t_ms,unix_ms,js_heap_used_bytes,nodes\n0,1000,10,2\n", None),
+        ] {
+            fs::write(run_dir.join("cdp.csv"), content).expect("cdp.csv must be written");
+
+            let run = load(&run_dir).expect("the run must load");
+
+            assert_eq!(run.cdp.len(), 1);
+            assert_eq!(run.cdp[0].target_id.as_deref(), target_id);
+            assert_eq!(run.cdp[0].session_id, None);
+            assert_eq!(run.cdp[0].js_heap_used_bytes, Some(10.0));
+            assert!(run.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn load_cdp_rejects_invalid_session_identity() {
+        let dir = TempDir::new().expect("the temporary directory must be created");
+        let run_dir = fixtures::write_run(dir.path());
+        let invalid = ["0", "-1", "1.5", "18446744073709551616", "text"];
+        let mut rows = vec![vec![
+            "t_ms".to_string(),
+            "unix_ms".to_string(),
+            "target_id".to_string(),
+            "session_id".to_string(),
+            "js_heap_used_bytes".to_string(),
+        ]];
+        for (index, session) in invalid.iter().enumerate() {
+            rows.push(vec![
+                index.to_string(),
+                (1000 + index).to_string(),
+                "page-1".to_string(),
+                session.to_string(),
+                "10".to_string(),
+            ]);
+        }
+        write_rows(&run_dir.join("cdp.csv"), &rows);
+
+        let run = load(&run_dir).expect("invalid session identities must not drop rows");
+
+        assert_eq!(run.cdp.len(), invalid.len());
+        for (index, sample) in run.cdp.iter().enumerate() {
+            assert_eq!(sample.target_id.as_deref(), Some("page-1"));
+            assert_eq!(sample.session_id, None, "{}", invalid[index]);
+            assert_eq!(sample.t_ms, index as u64);
+            assert_eq!(sample.js_heap_used_bytes, Some(10.0));
+        }
+        assert_eq!(
+            run.warnings,
+            vec![Warning {
+                kind: WarningKind::NonNumeric,
+                message: WarningMessage::NonNumericCells {
+                    file: "cdp.csv".to_string(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn load_cdp_filters_unusable_gauges() {
+        let dir = TempDir::new().expect("the temporary directory must be created");
+        let run_dir = fixtures::write_run(dir.path());
+        let values = ["", "text", "NaN", "inf", "-inf", "-1", "0", "12.5"];
+        let mut rows = vec![vec![
+            "t_ms".to_string(),
+            "unix_ms".to_string(),
+            "target_id".to_string(),
+            "js_heap_used_bytes".to_string(),
+            "nodes".to_string(),
+        ]];
+        for (index, value) in values.iter().enumerate() {
+            rows.push(vec![
+                index.to_string(),
+                (1000 + index).to_string(),
+                "page-1".to_string(),
+                value.to_string(),
+                value.to_string(),
+            ]);
+        }
+        write_rows(&run_dir.join("cdp.csv"), &rows);
+        rewrite_cell(&run_dir.join("process.csv"), 0, "private_bytes", "-1");
+        rewrite_cell(&run_dir.join("gpu.csv"), 0, "dedicated_bytes", "inf");
+
+        let run = load(&run_dir).expect("unusable gauges must not drop rows");
+
+        assert_eq!(run.cdp.len(), values.len());
+        for (index, sample) in run.cdp.iter().enumerate() {
+            let expected = match index {
+                6 => Some(0.0),
+                7 => Some(12.5),
+                _ => None,
+            };
+            assert_eq!(
+                sample.js_heap_used_bytes, expected,
+                "heap: {}",
+                values[index]
+            );
+            assert_eq!(sample.nodes, expected, "nodes: {}", values[index]);
+        }
+        assert_eq!(run.processes[0].private_bytes, Some(-1.0));
+        assert_eq!(run.gpu[0].dedicated_bytes, Some(f64::INFINITY));
+        assert_eq!(
+            run.warnings,
+            vec![Warning {
+                kind: WarningKind::NonNumeric,
+                message: WarningMessage::NonNumericCells {
+                    file: "cdp.csv".to_string(),
+                },
+            }]
+        );
+    }
 
     #[test]
     fn load_reads_complete_run() {
@@ -2256,24 +2772,206 @@ mod tests {
     }
 
     #[test]
-    fn cdp_series_sums_pages_per_tick() {
+    fn cdp_series_preserves_each_targets_own_ticks() {
         let mut run = fixtures::empty_run();
         run.cdp = vec![
-            cdp_sample(0, Some(10.0)),
-            cdp_sample(0, Some(20.0)),
-            cdp_sample(10_000, Some(30.0)),
+            cdp_target_sample(10_001, "B", Some(20.0), Some(200.0)),
+            cdp_target_sample(0, "A", Some(10.0), Some(100.0)),
+            cdp_target_sample(1, "B", Some(20.0), Some(200.0)),
+            cdp_target_sample(10_000, "A", Some(10.0), Some(100.0)),
+        ];
+        run.cdp[1].session_id = Some(1);
+        run.cdp[3].session_id = Some(2);
+        assert_eq!(cdp_target_ids(&run), vec!["A", "B"]);
+
+        for (target_id, ticks, heap, nodes) in [
+            ("A", vec![0, 10_000], 10.0, 100.0),
+            ("B", vec![1, 10_001], 20.0, 200.0),
+        ] {
+            for (series, value) in [
+                (
+                    cdp_series(&run, target_id, |sample| sample.js_heap_used_bytes),
+                    heap,
+                ),
+                (cdp_series(&run, target_id, |sample| sample.nodes), nodes),
+            ] {
+                let series = series.expect("a known target must have a series");
+                assert_eq!(series.xs, ticks);
+                assert_eq!(series.name, target_id);
+                assert_eq!(series.values, vec![Some(value), Some(value)]);
+                let stats = metric_stats(
+                    Some(&series),
+                    Window {
+                        start_ms: 0,
+                        end_ms: 10_001,
+                    },
+                    0,
+                );
+                assert_eq!(stats.delta, Some(0.0));
+                assert_eq!(stats.growth_per_hour, Some(0.0));
+                assert_eq!(stats.samples, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn cdp_series_keeps_last_row_on_timestamp_ties() {
+        let mut run = fixtures::empty_run();
+        run.cdp = vec![
+            cdp_target_sample(0, "A", Some(10.0), Some(100.0)),
+            cdp_target_sample(0, "A", Some(20.0), None),
+            cdp_target_sample(10_000, "A", Some(30.0), Some(300.0)),
+            cdp_target_sample(10_000, "A", None, Some(400.0)),
+            cdp_target_sample(20_000, "A", Some(40.0), Some(500.0)),
+            cdp_target_sample(20_000, "A", None, None),
         ];
 
-        let series = cdp_series(&run, |sample| sample.js_heap_used_bytes);
+        let heap = cdp_series(&run, "A", |sample| sample.js_heap_used_bytes)
+            .expect("the target must have a heap series");
+        let nodes = cdp_series(&run, "A", |sample| sample.nodes)
+            .expect("the target must have a nodes series");
 
-        assert_eq!(
-            series,
-            Some(series_of(
-                "tree",
-                vec![0, 10_000],
-                vec![Some(30.0), Some(30.0)]
-            ))
+        assert_eq!(heap.values, vec![Some(20.0), None, None]);
+        assert_eq!(nodes.values, vec![None, Some(400.0), None]);
+        assert_eq!(heap.xs, vec![0, 10_000, 20_000]);
+        assert_eq!(nodes.xs, heap.xs);
+        assert_eq!(heap.name, "A");
+        assert_eq!(nodes.name, "A");
+        assert_eq!(run.cdp.len(), 6, "raw tied rows must remain available");
+    }
+
+    #[test]
+    fn cdp_series_keeps_empty_known_targets() {
+        let mut run = fixtures::empty_run();
+        run.cdp = vec![
+            cdp_target_sample(0, "B", None, None),
+            cdp_target_sample(1, "A", Some(10.0), Some(100.0)),
+            cdp_target_sample(10_000, "B", None, None),
+        ];
+        run.cdp[2].session_id = Some(2);
+        assert_eq!(cdp_target_ids(&run), vec!["A", "B"]);
+
+        for series in [
+            cdp_series(&run, "B", |sample| sample.js_heap_used_bytes),
+            cdp_series(&run, "B", |sample| sample.nodes),
+        ] {
+            let series = series.expect("failed polls must preserve their target's series");
+            assert_eq!(series.xs, vec![0, 10_000]);
+            assert_eq!(series.values, vec![None, None]);
+            assert_eq!(series.name, "B");
+        }
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 1,
+                end_ms: 1,
+            },
+            0,
         );
+        assert!(
+            !summary
+                .whole_run
+                .metrics
+                .contains_key(&MetricId::JsHeapUsedBytes)
+        );
+        assert!(!summary.whole_run.metrics.contains_key(&MetricId::DomNodes));
+        assert_eq!(
+            cdp_series(&run, "missing", |sample| sample.js_heap_used_bytes),
+            None
+        );
+    }
+
+    #[test]
+    fn cdp_series_excludes_unknown_target_identity() {
+        let mut run = fixtures::empty_run();
+        run.cdp = vec![
+            cdp_target_sample(0, "", Some(10.0), Some(100.0)),
+            cdp_target_sample(1, "", Some(20.0), Some(200.0)),
+        ];
+        run.cdp[0].target_id = None;
+        run.cdp[0].session_id = Some(1);
+        let raw = run.cdp.clone();
+
+        assert_eq!(cdp_target_ids(&run), Vec::<String>::new());
+        assert_eq!(
+            cdp_series(&run, "", |sample| sample.js_heap_used_bytes),
+            None
+        );
+        assert_eq!(cdp_series(&run, "tree", |sample| sample.nodes), None);
+        assert_eq!(cdp_series(&run, "unnamed", |sample| sample.nodes), None);
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 1,
+            },
+            0,
+        );
+        assert!(
+            !summary
+                .whole_run
+                .metrics
+                .contains_key(&MetricId::JsHeapUsedBytes)
+        );
+        assert!(!summary.whole_run.metrics.contains_key(&MetricId::DomNodes));
+        assert_eq!(run.cdp, raw, "excluded rows must remain available");
+
+        run.cdp
+            .push(cdp_target_sample(2, "A", Some(30.0), Some(300.0)));
+        assert_eq!(cdp_target_ids(&run), vec!["A"]);
+        assert_eq!(
+            cdp_series(&run, "A", |sample| sample.js_heap_used_bytes),
+            Some(series_of("A", vec![2], vec![Some(30.0)]))
+        );
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 2,
+            },
+            0,
+        );
+        assert_eq!(
+            summary.whole_run.metrics[&MetricId::JsHeapUsedBytes].mean,
+            Some(30.0)
+        );
+        assert_eq!(
+            summary.whole_run.metrics[&MetricId::DomNodes].mean,
+            Some(300.0)
+        );
+        assert_eq!(&run.cdp[..2], raw.as_slice());
+    }
+
+    #[test]
+    fn cdp_series_filters_invalid_gauges_from_memory() {
+        let mut run = fixtures::empty_run();
+        let values = [
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(-1.0),
+            Some(0.0),
+            Some(12.5),
+        ];
+        run.cdp = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| cdp_target_sample(index as u64, "A", value, value))
+            .collect();
+
+        for series in [
+            cdp_series(&run, "A", |sample| sample.js_heap_used_bytes),
+            cdp_series(&run, "A", |sample| sample.nodes),
+        ] {
+            let series = series.expect("invalid gauges must not remove known target ticks");
+            assert_eq!(
+                series.values,
+                vec![None, None, None, None, None, Some(0.0), Some(12.5)]
+            );
+            assert_eq!(series.xs, (0..7).collect::<Vec<_>>());
+            assert_eq!(series.name, "A");
+        }
     }
 
     #[test]
@@ -2308,7 +3006,10 @@ mod tests {
         );
         assert_eq!(count_series(&run), None);
         assert_eq!(gpu_series(&run, |sample| sample.dedicated_bytes), None);
-        assert_eq!(cdp_series(&run, |sample| sample.js_heap_used_bytes), None);
+        assert_eq!(
+            cdp_series(&run, "page-1", |sample| sample.js_heap_used_bytes),
+            None
+        );
         assert_eq!(system_series(&run, |sample| sample.cpu_pct), None);
     }
 
@@ -2418,8 +3119,24 @@ mod tests {
         CdpSample {
             t_ms,
             unix_ms: t_ms,
+            target_id: Some("page-1".to_string()),
+            session_id: None,
             js_heap_used_bytes,
             nodes: None,
+        }
+    }
+
+    /// Builds a DevTools sample with the target identity and both gauges.
+    fn cdp_target_sample(
+        t_ms: u64,
+        target_id: &str,
+        js_heap_used_bytes: Option<f64>,
+        nodes: Option<f64>,
+    ) -> CdpSample {
+        CdpSample {
+            target_id: Some(target_id.to_string()),
+            nodes,
+            ..cdp_sample(t_ms, js_heap_used_bytes)
         }
     }
 
@@ -2626,6 +3343,425 @@ mod tests {
     }
 
     #[test]
+    fn summarize_separates_whole_run_and_steady_windows() {
+        let run = run_with_processes(vec![
+            process_sample(0, "100-1000", "main", Some(1000.0 * 1_048_576.0)),
+            process_sample(599_999, "100-1000", "main", Some(1000.0 * 1_048_576.0)),
+            process_sample(600_000, "100-1000", "main", Some(100.0 * 1_048_576.0)),
+            process_sample(1_200_000, "100-1000", "main", Some(100.0 * 1_048_576.0)),
+        ]);
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 1_200_000,
+            },
+            600_000,
+        );
+        let whole = &summary.whole_run.metrics[&MetricId::PrivateBytes];
+        let steady = &summary.steady_state.metrics[&MetricId::PrivateBytes];
+        assert_eq!(whole.start, Some(1000.0 * 1_048_576.0));
+        assert_eq!(whole.peak, Some(1000.0 * 1_048_576.0));
+        assert_eq!(whole.mean, Some(550.0 * 1_048_576.0));
+        assert_eq!(whole.end, Some(100.0 * 1_048_576.0));
+        assert_eq!(whole.delta, Some(-900.0 * 1_048_576.0));
+        assert_eq!(whole.samples, 4);
+        assert_eq!(whole.growth_per_hour, None);
+        assert_eq!(whole.r2, None);
+        assert_eq!(whole.median_hour_delta, None);
+        assert_eq!(steady.mean, Some(100.0 * 1_048_576.0));
+        assert_eq!(steady.p95, steady.mean);
+        assert_eq!(steady.growth_per_hour, Some(0.0));
+        assert_eq!(steady.r2, Some(1.0));
+        assert_eq!(steady.samples, 2);
+        assert!(summary.whole_run.has_data);
+        assert!(summary.steady_state.has_data);
+    }
+
+    #[test]
+    fn summarize_includes_warmup_and_window_boundaries() {
+        let run = run_with_processes(vec![
+            process_sample(99, "100-1000", "main", Some(999.0)),
+            process_sample(100, "100-1000", "main", Some(10.0)),
+            process_sample(200, "100-1000", "main", Some(20.0)),
+            process_sample(201, "100-1000", "main", Some(999.0)),
+        ]);
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 99,
+                end_ms: 200,
+            },
+            100,
+        );
+        assert_eq!(
+            summary.window,
+            Window {
+                start_ms: 99,
+                end_ms: 200
+            }
+        );
+        assert_eq!(summary.whole_run.window, Some(summary.window));
+        assert_eq!(
+            summary.steady_state.window,
+            Some(Window {
+                start_ms: 100,
+                end_ms: 200
+            })
+        );
+        let stats = &summary.steady_state.metrics[&MetricId::PrivateBytes];
+        assert_eq!(stats.start, Some(10.0));
+        assert_eq!(stats.end, Some(20.0));
+        assert_eq!(stats.samples, 2);
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 100,
+                end_ms: 200,
+            },
+            50,
+        );
+        assert_eq!(summary.steady_state.window, Some(summary.window));
+        assert_eq!(
+            summary.steady_state.metrics[&MetricId::PrivateBytes].samples,
+            2
+        );
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 99,
+                end_ms: 200,
+            },
+            201,
+        );
+        assert_eq!(summary.steady_state.window, None);
+        assert!(!summary.steady_state.has_data);
+        assert!(
+            summary
+                .steady_state
+                .metrics
+                .values()
+                .all(|stats| stats.samples == 0 && stats.mean.is_none())
+        );
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 201,
+                end_ms: 200,
+            },
+            0,
+        );
+        assert_eq!(summary.whole_run.window, None);
+        assert_eq!(summary.steady_state.window, None);
+        assert!(!summary.whole_run.has_data);
+    }
+
+    #[test]
+    fn summarize_one_point_has_no_growth() {
+        let run = run_with_processes(vec![process_sample(100, "100-1000", "main", Some(7.0))]);
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 100,
+            },
+            101,
+        );
+        assert_eq!(
+            summary.steady_state.metrics[&MetricId::PrivateBytes].samples,
+            0
+        );
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 100,
+            },
+            100,
+        );
+        for window in [&summary.whole_run, &summary.steady_state] {
+            let stats = &window.metrics[&MetricId::PrivateBytes];
+            for value in [
+                stats.start,
+                stats.peak,
+                stats.mean,
+                stats.p50,
+                stats.p95,
+                stats.end,
+            ] {
+                assert_eq!(value, Some(7.0));
+            }
+            assert_eq!(stats.delta, Some(0.0));
+            assert_eq!(stats.samples, 1);
+            assert_eq!(stats.growth_per_hour, None);
+            assert_eq!(stats.r2, None);
+            assert_eq!(stats.median_hour_delta, None);
+            assert!(window.has_data);
+        }
+    }
+
+    #[test]
+    fn summarize_computes_cpu_percent_for_each_window() {
+        let mut run = run_with_processes(vec![
+            blank_process_sample(0, "100-1000", "main"),
+            blank_process_sample(100, "100-1000", "main"),
+            blank_process_sample(200, "100-1000", "main"),
+        ]);
+        for (sample, value) in run.processes.iter_mut().zip([90.0, 10.0, 10.0]) {
+            sample.cpu_pct = Some(value);
+        }
+        run.job = vec![
+            job_sample(0, Some(1000.0), Some(1000.0)),
+            job_sample(300, Some(9000.0), Some(1000.0)),
+        ];
+        run.events = vec![
+            event_sample(0, ProcessEvent::Start),
+            event_sample(300, ProcessEvent::Exit),
+        ];
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 200,
+            },
+            100,
+        );
+        assert_eq!(summary.steady_state.cpu.mean_pct, Some(10.0));
+        assert_eq!(summary.steady_state.cpu.p50_pct, Some(10.0));
+        assert_eq!(summary.steady_state.cpu.p95_pct, Some(10.0));
+        assert_eq!(summary.steady_state.cpu.samples, 2);
+        assert_eq!(summary.whole_run.cpu.mean_pct, Some(110.0 / 3.0));
+        assert_eq!(summary.whole_run.cpu.p50_pct, Some(10.0));
+        assert_eq!(summary.whole_run.cpu.p95_pct, Some(82.0));
+        assert_eq!(summary.whole_run.cpu.samples, 3);
+        assert_eq!(summary.cpu.total_seconds, Some(10.0));
+        assert!(!summary.cpu.from_process_rows);
+        assert_eq!(
+            summary.processes,
+            ProcessStats {
+                started: 1,
+                exited: 1,
+                max_concurrent: 1
+            }
+        );
+        assert!(summary.steady_state.has_data, "CPU-only windows are usable");
+        run.meta.tree_walk_fallback = true;
+        run.processes[2].cpu_user_ms = Some(6000.0);
+        run.processes[2].cpu_kernel_ms = Some(1000.0);
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 200,
+            },
+            100,
+        );
+        assert_eq!(summary.cpu.total_seconds, Some(7.0));
+        assert!(summary.cpu.from_process_rows);
+    }
+
+    #[test]
+    fn summarize_target_sample_counts_are_metric_and_window_specific() {
+        let mut run = fixtures::empty_run();
+        run.cdp = vec![
+            cdp_target_sample(0, "B", None, None),
+            cdp_target_sample(0, "A", Some(10.0), Some(100.0)),
+            cdp_target_sample(100, "A", Some(0.0), None),
+            cdp_target_sample(150, "A", None, Some(0.0)),
+            cdp_target_sample(200, "A", None, Some(0.0)),
+            cdp_target_sample(201, "A", Some(f64::NAN), Some(-1.0)),
+            cdp_target_sample(202, "B", None, None),
+        ];
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 202,
+            },
+            100,
+        );
+        assert_eq!(
+            summary.whole_run.metrics.len(),
+            8,
+            "multiple recorded targets must omit primary CDP metrics"
+        );
+        assert_eq!(summary.steady_state.metrics.len(), 8);
+        assert_eq!(summary.primary_cdp_target, None);
+        assert_eq!(
+            summary
+                .cdp_targets
+                .iter()
+                .map(|target| target.target_id.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        let a = &summary.cdp_targets[0];
+        for metric in [MetricId::JsHeapUsedBytes, MetricId::DomNodes] {
+            assert_eq!(a.whole_run.len(), 2);
+            assert_eq!(a.steady_state.len(), 2);
+            let steady_samples = if metric == MetricId::JsHeapUsedBytes {
+                1
+            } else {
+                2
+            };
+            assert_eq!(a.whole_run[&metric].samples, steady_samples + 1);
+            assert_eq!(a.steady_state[&metric].samples, steady_samples);
+            assert_eq!(a.steady_state[&metric].mean, Some(0.0));
+            let b = &summary.cdp_targets[1];
+            assert_eq!(b.whole_run[&metric].samples, 0);
+            assert_eq!(b.steady_state[&metric].samples, 0);
+        }
+        assert!(
+            summary.steady_state.has_data,
+            "target-only zero values count as data"
+        );
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 201,
+                end_ms: 202,
+            },
+            100,
+        );
+        assert!(
+            !summary.steady_state.has_data,
+            "failed and invalid rows are not usable data"
+        );
+        assert_eq!(
+            summary.primary_cdp_target, None,
+            "identity is based on the entire run"
+        );
+        run.cdp
+            .retain(|sample| sample.target_id.as_deref() == Some("A"));
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 202,
+            },
+            100,
+        );
+        assert_eq!(summary.primary_cdp_target.as_deref(), Some("A"));
+        for metric in [MetricId::JsHeapUsedBytes, MetricId::DomNodes] {
+            assert_eq!(
+                summary.whole_run.metrics[&metric],
+                summary.cdp_targets[0].whole_run[&metric]
+            );
+            assert_eq!(
+                summary.steady_state.metrics[&metric],
+                summary.cdp_targets[0].steady_state[&metric]
+            );
+        }
+    }
+
+    #[test]
+    fn summarize_hour_delta_requires_two_hours_after_threshold() {
+        let run = run_with_processes(vec![
+            process_sample(999, "100-1000", "main", Some(1000.0)),
+            process_sample(1000, "100-1000", "main", Some(10.0)),
+            process_sample(3_600_999, "100-1000", "main", Some(20.0)),
+            process_sample(3_601_000, "100-1000", "main", Some(30.0)),
+            process_sample(7_201_000, "100-1000", "main", Some(50.0)),
+            process_sample(7_201_001, "100-1000", "main", Some(1000.0)),
+        ]);
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 7_201_000,
+            },
+            1000,
+        );
+        assert_eq!(
+            summary.whole_run.metrics[&MetricId::PrivateBytes].median_hour_delta,
+            None,
+            "whole-run statistics must not contain a trend"
+        );
+        assert!(!summary.steady_state.too_short_for_hour_delta);
+        assert_eq!(
+            summary.steady_state.metrics[&MetricId::PrivateBytes].median_hour_delta,
+            Some(25.0)
+        );
+        let short = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 7_200_999,
+            },
+            1000,
+        );
+        assert!(short.steady_state.too_short_for_hour_delta);
+        assert_eq!(
+            short.steady_state.metrics[&MetricId::PrivateBytes].median_hour_delta,
+            None
+        );
+        for ticks in [vec![3_601_000, 7_201_000], vec![1000, 3_600_999]] {
+            let run = run_with_processes(
+                ticks
+                    .into_iter()
+                    .map(|tick| process_sample(tick, "100-1000", "main", Some(1.0)))
+                    .collect(),
+            );
+            let summary = summarize(
+                &run,
+                Window {
+                    start_ms: 0,
+                    end_ms: 7_201_000,
+                },
+                1000,
+            );
+            assert_eq!(
+                summary.steady_state.metrics[&MetricId::PrivateBytes].median_hour_delta,
+                None,
+                "both hour buckets need data"
+            );
+        }
+    }
+
+    #[test]
+    fn summarize_does_not_combine_distinct_cdp_targets() {
+        let dir = TempDir::new().expect("the temporary directory must be created");
+        let run_dir = fixtures::write_run(dir.path());
+        for second_offset in [0, 1] {
+            fs::write(
+                run_dir.join("cdp.csv"),
+                format!(
+                    "t_ms,unix_ms,target_id,js_heap_used_bytes,nodes\n\
+                     0,1000,A,10485760,100\n\
+                     {second_offset},{},B,20971520,200\n\
+                     10000,11000,A,10485760,100\n\
+                     {},{},B,20971520,200\n",
+                    1000 + second_offset,
+                    10_000 + second_offset,
+                    11_000 + second_offset,
+                ),
+            )
+            .expect("cdp.csv must be written");
+            let run = load(&run_dir).expect("the multi-target run must load");
+
+            for window in [
+                Window {
+                    start_ms: 0,
+                    end_ms: 10_001,
+                },
+                Window {
+                    start_ms: 0,
+                    end_ms: 0,
+                },
+            ] {
+                let summary = summarize(&run, window, 0);
+                for metric in [MetricId::JsHeapUsedBytes, MetricId::DomNodes] {
+                    assert!(
+                        !summary.whole_run.metrics.contains_key(&metric),
+                        "multi-target primary statistics must be absent for {metric:?}"
+                    );
+                    assert!(!summary.steady_state.metrics.contains_key(&metric));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn summarize_flags_short_runs() {
         let run = run_with_processes(vec![
             process_sample(0, "100-1000", "main", Some(100.0)),
@@ -2641,9 +3777,10 @@ mod tests {
             0,
         );
 
-        assert!(summary.too_short_for_hour_delta);
+        assert!(summary.steady_state.too_short_for_hour_delta);
         assert!(
             summary
+                .steady_state
                 .metrics
                 .values()
                 .all(|stats| stats.median_hour_delta.is_none()),
@@ -2684,10 +3821,10 @@ mod tests {
             0,
         );
 
-        assert!(summary.metrics[&MetricId::PrivateBytes].samples > 0);
-        assert!(summary.metrics[&MetricId::Handles].samples > 0);
-        assert!(summary.metrics[&MetricId::Threads].samples > 0);
-        assert_eq!(summary.metrics[&MetricId::DomNodes].samples, 0);
+        assert!(summary.whole_run.metrics[&MetricId::PrivateBytes].samples > 0);
+        assert!(summary.whole_run.metrics[&MetricId::Handles].samples > 0);
+        assert!(summary.whole_run.metrics[&MetricId::Threads].samples > 0);
+        assert!(!summary.whole_run.metrics.contains_key(&MetricId::DomNodes));
     }
 
     #[test]
@@ -2772,6 +3909,283 @@ mod tests {
 
     /// Wall-clock base of the computed-warning tests.
     const BASE_UNIX_MS: u64 = 1_700_000_000_000;
+
+    /// Renders computed warnings through the existing report entry point.
+    fn warning_strings(run: &Run, warmup_ms: u64) -> Vec<String> {
+        let summary = summarize(
+            run,
+            Window {
+                start_ms: 0,
+                end_ms: run.duration_ms(),
+            },
+            warmup_ms,
+        );
+        crate::report::build(run, &summary, crate::report::Lang::En).warnings
+    }
+
+    #[test]
+    fn warnings_report_requested_empty_cdp_for_waiting_and_ok() {
+        for status in [CollectorStatus::Waiting, CollectorStatus::Ok] {
+            for rows in [vec![], vec![cdp_target_sample(0, "A", None, None)]] {
+                let mut run = fixtures::empty_run();
+                run.meta.collectors.insert("cdp".into(), status.clone());
+                run.cdp = rows;
+                let warnings = warning_strings(&run, 600_000);
+                assert_eq!(
+                    warnings
+                        .iter()
+                        .filter(|w| w.starts_with("CDP requested"))
+                        .collect::<Vec<_>>(),
+                    [
+                        "CDP requested, but no usable JS heap and DOM nodes samples for the whole run"
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn warnings_report_missing_cdp_metric_and_empty_target() {
+        let mut run = fixtures::empty_run();
+        run.cdp = vec![
+            cdp_target_sample(0, "A", None, Some(7.0)),
+            cdp_target_sample(1, "B", None, None),
+        ];
+        assert_eq!(
+            warning_strings(&run, 600_000),
+            [
+                "CDP requested, but no usable JS heap samples for the whole run",
+                "CDP requested, but no usable DOM nodes samples for CDP target B",
+            ]
+        );
+        run.cdp = vec![
+            cdp_target_sample(0, "A", Some(10.0), Some(7.0)),
+            cdp_target_sample(1, "A", Some(11.0), None),
+            cdp_target_sample(2, "B", None, None),
+            cdp_target_sample(3, "C", None, Some(8.0)),
+            cdp_target_sample(4, "D", Some(9.0), None),
+            // A later empty row invalidates the entire earlier duplicate.
+            cdp_target_sample(2, "B", Some(1.0), Some(1.0)),
+            cdp_target_sample(2, "B", None, None),
+        ];
+        assert_eq!(
+            warning_strings(&run, 600_000),
+            [
+                "CDP requested, but no usable JS heap and DOM nodes samples for CDP target B",
+                "CDP requested, but no usable JS heap samples for CDP target C",
+                "CDP requested, but no usable DOM nodes samples for CDP target D",
+            ]
+        );
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 4,
+            },
+            600_000,
+        );
+        let counts: Vec<_> = summary
+            .cdp_targets
+            .iter()
+            .map(|target| {
+                (
+                    target.target_id.as_str(),
+                    target.whole_run[&MetricId::JsHeapUsedBytes].samples,
+                    target.whole_run[&MetricId::DomNodes].samples,
+                )
+            })
+            .collect();
+        assert_eq!(counts, [("A", 2, 1), ("B", 0, 0), ("C", 0, 1), ("D", 1, 0)]);
+    }
+
+    #[test]
+    fn warnings_accept_zero_cdp_values() {
+        let mut run = fixtures::empty_run();
+        run.cdp = vec![cdp_target_sample(0, "A", Some(0.0), Some(0.0))];
+        assert!(warning_strings(&run, 600_000).is_empty());
+    }
+
+    #[test]
+    fn warnings_report_final_cdp_waiting_after_earlier_values() {
+        let mut run = fixtures::empty_run();
+        run.meta
+            .collectors
+            .insert("cdp".into(), CollectorStatus::Waiting);
+        run.cdp = vec![cdp_target_sample(0, "A", Some(0.0), Some(7.0))];
+        assert_eq!(
+            warning_strings(&run, 600_000),
+            ["CDP source was unavailable at the end of the run"]
+        );
+        run.meta.ended_at = None;
+        assert!(
+            warning_strings(&run, 600_000).is_empty(),
+            "a running source is not final"
+        );
+    }
+
+    #[test]
+    fn warnings_do_not_infer_request_from_missing_cdp_file() {
+        let mut run = fixtures::empty_run();
+        run.meta.collectors.clear();
+        run.meta.env_overrides.clear();
+        run.warnings.push(Warning {
+            kind: WarningKind::NoData,
+            message: WarningMessage::MissingFile {
+                file: "cdp.csv".into(),
+            },
+        });
+        assert_eq!(warning_strings(&run, 0), ["no data: missing file cdp.csv"]);
+        for status in [None, Some(CollectorStatus::Disabled)] {
+            run.meta.collectors.clear();
+            if let Some(status) = status {
+                run.meta.collectors.insert("cdp".into(), status);
+            }
+            for value in [
+                "--other --remote-debugging-port=not-a-port",
+                "--remote-debugging-port=0",
+            ] {
+                run.meta
+                    .env_overrides
+                    .insert("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS".into(), value.into());
+                assert!(
+                    warning_strings(&run, 0)
+                        .iter()
+                        .any(|w| w.starts_with("CDP requested"))
+                );
+            }
+            for value in [
+                "--remote-debugging-port=",
+                "--other=--remote-debugging-port=9222",
+                "",
+            ] {
+                run.meta
+                    .env_overrides
+                    .insert("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS".into(), value.into());
+                assert!(
+                    warning_strings(&run, 0)
+                        .iter()
+                        .all(|w| !w.starts_with("CDP requested"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn warnings_report_unknown_cdp_target_identity_once() {
+        let mut run = fixtures::empty_run();
+        run.cdp = vec![
+            cdp_target_sample(0, "A", Some(0.0), Some(0.0)),
+            CdpSample {
+                target_id: None,
+                ..cdp_sample(1, Some(100.0))
+            },
+            cdp_target_sample(2, "", Some(200.0), Some(200.0)),
+        ];
+        assert_eq!(
+            warning_strings(&run, 0),
+            ["CDP: 2 rows without target identity were excluded"]
+        );
+        assert_eq!(cdp_target_ids(&run), ["A"]);
+        assert_eq!(
+            run.cdp[0].session_id, None,
+            "legacy unknown sessions remain usable"
+        );
+        assert_eq!(run.cdp.len(), 3, "raw rows are preserved");
+    }
+
+    #[test]
+    fn warnings_use_whole_run_for_gaps_and_noise() {
+        let mut run = run_with_processes(vec![
+            warning_process_sample(0, BASE_UNIX_MS, Some(10.0)),
+            warning_process_sample(1000, BASE_UNIX_MS + 6000, Some(10.0)),
+            warning_process_sample(2000, BASE_UNIX_MS + 7000, Some(10.0)),
+        ]);
+        run.system = vec![
+            warning_system_sample(0, BASE_UNIX_MS, Some(90.0), Some(5.0)),
+            warning_system_sample(1000, BASE_UNIX_MS + 6000, Some(90.0), Some(5.0)),
+            warning_system_sample(2000, BASE_UNIX_MS + 7000, Some(15.0), Some(5.0)),
+        ];
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 2000,
+            },
+            2000,
+        );
+        assert!(summary.steady_state.has_data);
+        let warnings = compute_warnings(&run, &summary);
+        assert!(warnings.iter().any(|w| w.kind == WarningKind::TimeGap));
+        assert!(warnings.iter().any(|w| w.kind == WarningKind::NoisyMachine));
+    }
+
+    #[test]
+    fn warnings_report_every_final_shutdown_issue() {
+        use crate::meta::{ShutdownIssue, ShutdownReason, ShutdownState};
+        let mut run = fixtures::empty_run();
+        run.cdp = vec![cdp_target_sample(0, "A", Some(0.0), Some(0.0))];
+        run.meta.shutdown_issues = vec![
+            ShutdownIssue {
+                pid: 10,
+                proc_key: Some("10-100".into()),
+                role: "renderer".into(),
+                state: ShutdownState::Alive,
+                reason: ShutdownReason::AccessDenied,
+            },
+            ShutdownIssue {
+                pid: 20,
+                proc_key: None,
+                role: "utility".into(),
+                state: ShutdownState::Unknown,
+                reason: ShutdownReason::IdentityUnknown,
+            },
+        ];
+        assert_eq!(
+            warning_strings(&run, 0),
+            [
+                "Incomplete shutdown: PID 10, identity 10-100, role renderer, state alive, reason access denied",
+                "Incomplete shutdown: PID 20, identity —, role utility, state unknown, reason identity unknown",
+            ]
+        );
+    }
+
+    #[test]
+    fn warnings_deduplicate_identical_messages() {
+        let mut run = fixtures::empty_run();
+        let reading = Warning {
+            kind: WarningKind::NoData,
+            message: WarningMessage::MissingFile {
+                file: "gpu.csv".into(),
+            },
+        };
+        let fallback = Warning {
+            kind: WarningKind::TreeWalkFallback,
+            message: WarningMessage::TreeWalkFallback,
+        };
+        run.warnings = vec![reading.clone(), fallback.clone(), reading.clone()];
+        run.meta.tree_walk_fallback = true;
+        run.meta.collectors.remove("cdp");
+        run.meta.env_overrides.clear();
+        let summary = summarize(
+            &run,
+            Window {
+                start_ms: 0,
+                end_ms: 0,
+            },
+            0,
+        );
+        assert_eq!(compute_warnings(&run, &summary), [reading, fallback]);
+    }
+
+    #[test]
+    fn warnings_keep_disabled_collector_diagnostic() {
+        let mut run = fixtures::empty_run();
+        run.meta
+            .collectors
+            .insert("cdp".into(), CollectorStatus::Disabled);
+        run.meta.env_overrides.clear();
+        assert_eq!(warning_strings(&run, 0), ["collector cdp: disabled"]);
+    }
 
     #[test]
     fn warnings_report_time_gaps() {
